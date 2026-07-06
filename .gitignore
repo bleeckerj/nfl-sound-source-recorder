@@ -1,0 +1,11 @@
+# SwiftPM build artifacts
+.build/
+
+# Built app bundles / distribution output
+dist/
+
+# Runtime logs
+logs/
+
+# macOS
+.DS_Store
