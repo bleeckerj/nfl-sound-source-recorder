@@ -94,6 +94,18 @@ public struct AudioDeviceInfo: Identifiable, Hashable, Sendable {
     public let uid: String
     public let name: String
     public let outputChannels: Int
+    /// Input (recording) channels the device exposes. `0` for devices enumerated purely
+    /// as output destinations; populated by `inputDevices()`.
+    public let inputChannels: Int
+
+    public init(id: AudioObjectID, uid: String, name: String,
+                outputChannels: Int, inputChannels: Int = 0) {
+        self.id = id
+        self.uid = uid
+        self.name = name
+        self.outputChannels = outputChannels
+        self.inputChannels = inputChannels
+    }
 }
 
 public enum AudioSystem {
@@ -117,12 +129,16 @@ public enum AudioSystem {
         try CA.value(systemObject, kAudioHardwarePropertyDefaultOutputDevice, default: AudioObjectID(0))
     }
 
+    public static func defaultInputDevice() throws -> AudioObjectID {
+        try CA.value(systemObject, kAudioHardwarePropertyDefaultInputDevice, default: AudioObjectID(0))
+    }
+
     /// All hardware devices that expose at least one output channel.
     public static func outputDevices() throws -> [AudioDeviceInfo] {
         let ids = try CA.array(systemObject, kAudioHardwarePropertyDevices, of: AudioObjectID.self)
         var result: [AudioDeviceInfo] = []
         for id in ids {
-            let channels = (try? outputChannelCount(id)) ?? 0
+            let channels = (try? channelCount(id, scope: kAudioDevicePropertyScopeOutput)) ?? 0
             guard channels > 0 else { continue }
             let uid = (try? CA.string(id, kAudioDevicePropertyDeviceUID)) ?? ""
             let name = (try? CA.string(id, kAudioObjectPropertyName)) ?? "(unknown)"
@@ -131,10 +147,35 @@ public enum AudioSystem {
         return result
     }
 
+    /// All hardware devices that expose at least one input (recording) channel — the
+    /// candidate microphones. Mirrors `outputDevices()` on the input scope.
+    public static func inputDevices() throws -> [AudioDeviceInfo] {
+        let ids = try CA.array(systemObject, kAudioHardwarePropertyDevices, of: AudioObjectID.self)
+        var result: [AudioDeviceInfo] = []
+        for id in ids {
+            let channels = (try? channelCount(id, scope: kAudioDevicePropertyScopeInput)) ?? 0
+            guard channels > 0 else { continue }
+            let uid = (try? CA.string(id, kAudioDevicePropertyDeviceUID)) ?? ""
+            let name = (try? CA.string(id, kAudioObjectPropertyName)) ?? "(unknown)"
+            result.append(AudioDeviceInfo(id: id, uid: uid, name: name,
+                                          outputChannels: 0, inputChannels: channels))
+        }
+        return result
+    }
+
     static func outputChannelCount(_ device: AudioObjectID) throws -> Int {
+        try channelCount(device, scope: kAudioDevicePropertyScopeOutput)
+    }
+
+    static func inputChannelCount(_ device: AudioObjectID) throws -> Int {
+        try channelCount(device, scope: kAudioDevicePropertyScopeInput)
+    }
+
+    /// Total channels across every stream of `device` in the given scope (input or output).
+    static func channelCount(_ device: AudioObjectID, scope: AudioObjectPropertyScope) throws -> Int {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyStreamConfiguration,
-            mScope: kAudioDevicePropertyScopeOutput,
+            mScope: scope,
             mElement: kAudioObjectPropertyElementMain
         )
         var size: UInt32 = 0

@@ -25,15 +25,28 @@ func printUsage() {
     USAGE:
       nfl-sound-recorder --list
       nfl-sound-recorder [--app <bundleID> | --pid <pid> | --system]
-                         [--out <deviceUID>] [--file <path>] [--mute]
+                         [--mic <deviceUID> | --mic-default]
+                         [--out <deviceUID> | --no-route] [--file <path>] [--mute]
 
     OPTIONS:
-      --list            List running apps and available output devices, then exit.
+      --list            List running apps and available input/output devices, then exit.
       --app <bundleID>  Capture an audio-first application by bundle id (see --list).
       --pid <pid>       Capture a running process by pid.
       --system          Capture all system audio.
+      --mic <deviceUID> Also capture this microphone/input device and MIX it into the
+                        recording. Omit the tap flags (--app/--pid/--system) to record
+                        the mic ALONE.
+      --mic-default     Like --mic, using the system default input device.
+      --mic-level <dB>  Microphone feed level in dB (0 = unity, default 0). For balance.
+      --source-level <dB> Tap/system feed level in dB (0 = unity, default 0). For balance.
       --out <deviceUID> Output device UID to route to (default: current default output).
-      --file <path>     Output file path (default: ./recording-<timestamp>.caf).
+      --no-route        Record only — a tap-only aggregate, no output device, nothing
+                        plays out (null sink). Overrides --out.
+      --file <path>     Output file path (default: ./recording-<timestamp>.<ext>).
+      --format <fmt>    Recording format: caf, wav, aiff, aac, alac, flac (default: caf).
+                        caf/wav/aiff/alac/flac are lossless; aac is lossy (small files).
+                        If omitted but --file has a known extension, the format is
+                        inferred from it. macOS has no MP3 encoder — use aac instead.
       --mute            Silence the app's normal output so only the routed copy is heard.
       --eq <g0,..,g9>   Enable the 10-band EQ with per-band gains in dB, low→high
                         (32,64,125,250,500,1k,2k,4k,8k,16k Hz). e.g. --eq 6,4,0,0,0,0,0,3,5,5
@@ -70,6 +83,17 @@ func listEverything() {
     } catch {
         print("  Error enumerating devices: \(error)")
     }
+
+    print("\nInput devices (microphones):")
+    do {
+        let defaultID = try AudioSystem.defaultInputDevice()
+        for dev in try AudioSystem.inputDevices() {
+            let marker = dev.id == defaultID ? " (default)" : ""
+            print("  \(dev.name) — \(dev.inputChannels)ch\(marker)\n      UID: \(dev.uid)")
+        }
+    } catch {
+        print("  Error enumerating input devices: \(error)")
+    }
 }
 
 // MARK: - Resolve target + device
@@ -87,7 +111,24 @@ func resolveTarget() -> ProcessTapRecorder.Target? {
     return nil
 }
 
-func resolveOutputDevice() throws -> AudioDeviceInfo {
+/// Resolve the microphone/input device from --mic <uid> or --mic-default, or nil if the
+/// user asked for no mic. Throws if a requested device can't be found.
+func resolveMicDevice() throws -> AudioDeviceInfo? {
+    let devices = try AudioSystem.inputDevices()
+    if let wanted = argValue("--mic") {
+        if let match = devices.first(where: { $0.uid == wanted }) { return match }
+        throw CLIError(message: "No input device with UID \(wanted). Use --list to see inputs.")
+    }
+    if hasFlag("--mic-default") {
+        let defaultID = try AudioSystem.defaultInputDevice()
+        if let match = devices.first(where: { $0.id == defaultID }) ?? devices.first { return match }
+        throw CLIError(message: "No input devices found.")
+    }
+    return nil
+}
+
+func resolveOutputDevice() throws -> AudioDeviceInfo? {
+    if hasFlag("--no-route") { return nil }   // record-only: tap-only aggregate
     let devices = try AudioSystem.outputDevices()
     if let wanted = argValue("--out") {
         if let match = devices.first(where: { $0.uid == wanted }) { return match }
@@ -221,6 +262,7 @@ if hasFlag("--selftest-eq") {
 
 if hasFlag("--check-permission") {
     print("System Audio Recording (kTCCServiceAudioCapture): \(AudioCapturePermission.status().rawValue)")
+    print("Microphone (kTCCServiceMicrophone):               \(MicrophonePermission.status().rawValue)")
     exit(0)
 }
 
@@ -229,24 +271,76 @@ if hasFlag("--selftest-spectrum") {
     exit(0)
 }
 
-guard let target = resolveTarget() else {
-    FileHandle.standardError.write("Specify a target: --app <bundleID>, --pid <pid>, or --system. Use --list to explore.\n".data(using: .utf8)!)
-    exit(1)
+// The tap is now optional: with a --mic flag you can record the mic alone. Validation
+// (at least one source) happens once the mic device is resolved, inside the do-block.
+let tapTarget = resolveTarget()
+
+func targetLabel(_ t: ProcessTapRecorder.Target) -> String {
+    switch t {
+    case .pid(let pid): return "pid \(pid)"
+    case .systemWide:   return "system audio"
+    }
 }
 
+// Resolve format: explicit --format wins; otherwise infer from --file's extension;
+// otherwise default to CAF. An unknown --format value is a hard error.
+let format: RecordingFormat = {
+    if let raw = argValue("--format") {
+        guard let f = RecordingFormat(rawValue: raw.lowercased()) else {
+            let choices = RecordingFormat.allCases.map(\.rawValue).joined(separator: ", ")
+            FileHandle.standardError.write("Unknown --format \"\(raw)\". Choose one of: \(choices)\n".data(using: .utf8)!)
+            exit(1)
+        }
+        return f
+    }
+    if let path = argValue("--file"),
+       let inferred = RecordingFormat(fileExtension: (path as NSString).pathExtension) {
+        return inferred
+    }
+    return .caf
+}()
+
 let fileURL: URL = {
-    if let path = argValue("--file") { return URL(fileURLWithPath: path) }
+    if let path = argValue("--file") {
+        let url = URL(fileURLWithPath: path)
+        // Make the extension agree with the chosen codec, or AVAudioFile's inferred
+        // container won't match what we're encoding (e.g. .wav holding AAC).
+        if url.pathExtension.lowercased() != format.fileExtension {
+            let fixed = url.deletingPathExtension().appendingPathExtension(format.fileExtension)
+            FileHandle.standardError.write("Note: writing \(format.rawValue) → \(fixed.lastPathComponent)\n".data(using: .utf8)!)
+            return fixed
+        }
+        return url
+    }
     let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
     return URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
-        .appendingPathComponent("recording-\(stamp).caf")
+        .appendingPathComponent("recording-\(stamp).\(format.fileExtension)")
 }()
 
 do {
     let device = try resolveOutputDevice()
+    let mic = try resolveMicDevice()
+
+    // Build the capture source; require at least one of tap / mic.
+    let source: ProcessTapRecorder.Source
+    let sourceLabel: String
+    switch (tapTarget, mic) {
+    case let (.some(t), .some(m)): source = .mix(tap: t, mic: m); sourceLabel = "\(targetLabel(t)) + mic (\(m.name))"
+    case let (.some(t), .none):    source = .tap(t); sourceLabel = targetLabel(t)
+    case let (.none, .some(m)):    source = .microphone(m); sourceLabel = "mic (\(m.name))"
+    case (.none, .none):
+        FileHandle.standardError.write("Specify a source: a tap (--app/--pid/--system) and/or a mic (--mic/--mic-default). Use --list to explore.\n".data(using: .utf8)!)
+        exit(1)
+    }
+    let hasTap = tapTarget != nil
+    let hasMic = mic != nil
+
     let warmup = argValue("--warmup").flatMap(Double.init) ?? 0.6
-    let recorder = ProcessTapRecorder(target: target, outputDevice: device, fileURL: fileURL,
-                                      mute: hasFlag("--mute"), driftCompensation: hasFlag("--drift"),
-                                      warmupSeconds: warmup)
+    let recorder = ProcessTapRecorder(source: source, outputDevice: device, fileURL: fileURL,
+                                      format: format, mute: hasFlag("--mute"),
+                                      driftCompensation: hasFlag("--drift"), warmupSeconds: warmup)
+    if let lvl = argValue("--source-level").flatMap(Double.init) { recorder.setSourceGain(dB: lvl) }
+    if let lvl = argValue("--mic-level").flatMap(Double.init) { recorder.setMicGain(dB: lvl) }
 
     if let eqArg = argValue("--eq") {
         let gains = eqArg.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
@@ -255,18 +349,32 @@ do {
         print("EQ enabled — gains (dB): \(gains)")
     }
 
-    // Ensure System Audio Recording consent (kTCCServiceAudioCapture) before we
-    // start — request it explicitly via the TCC SPI rather than relying on the
-    // (unreliable) automatic prompt.
-    let permission = AudioCapturePermission.status()
-    print("System Audio Recording permission: \(permission.rawValue)")
-    if permission != .authorized {
-        let sem = DispatchSemaphore(value: 0)
-        AudioCapturePermission.request { granted in
-            print("Permission request result: \(granted ? "granted" : "denied")")
-            sem.signal()
+    // Ensure the consents we actually need before starting: System Audio Recording
+    // (kTCCServiceAudioCapture) for a tap, Microphone (kTCCServiceMicrophone) for a mic.
+    // Request explicitly via a semaphore rather than relying on the automatic prompt.
+    if hasTap {
+        let permission = AudioCapturePermission.status()
+        print("System Audio Recording permission: \(permission.rawValue)")
+        if permission != .authorized {
+            let sem = DispatchSemaphore(value: 0)
+            AudioCapturePermission.request { granted in
+                print("Audio-capture permission result: \(granted ? "granted" : "denied")")
+                sem.signal()
+            }
+            sem.wait()
         }
-        sem.wait()
+    }
+    if hasMic {
+        let mp = MicrophonePermission.status()
+        print("Microphone permission: \(mp.rawValue)")
+        if mp != .authorized {
+            let sem = DispatchSemaphore(value: 0)
+            MicrophonePermission.request { granted in
+                print("Microphone permission result: \(granted ? "granted" : "denied")")
+                sem.signal()
+            }
+            sem.wait()
+        }
     }
 
     // Shared teardown: stop, report whether any signal was captured, exit.
@@ -291,11 +399,13 @@ do {
     }
 
     try recorder.start()
-    switch target {
-    case .pid(let pid): print("Recording pid \(pid) → \(fileURL.lastPathComponent), routing to \"\(device.name)\".")
-    case .systemWide:   print("Recording system audio → \(fileURL.lastPathComponent), routing to \"\(device.name)\".")
+    let routing = device.map { "routing to \"\($0.name)\"" } ?? "record only (no routing)"
+    print("Recording \(sourceLabel) → \(fileURL.lastPathComponent), \(routing).")
+    if hasMic && device != nil {
+        print("⚠️  Mic + routing to a device can feed back (the mic hears the speakers). Use headphones or --no-route.")
     }
     print("Capture format: \(recorder.captureDescription ?? "unknown")")
+    print("File format:    \(format.displayName)\(format.isLossless ? "" : " — lossy")")
     print("Press Ctrl-C to stop.\n")
 
     // Live level meter, so you can SEE whether the tap is delivering signal.

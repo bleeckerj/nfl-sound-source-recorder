@@ -18,22 +18,26 @@ final class RecorderSession {
     private(set) var eqEnabled = false
     private(set) var eqGains = [Double](repeating: 0, count: GraphicEQ.bandCount)
 
-    func start(target: ProcessTapRecorder.Target,
+    func start(source: ProcessTapRecorder.Source,
                sourceLabel: String,
-               device: AudioDeviceInfo,
+               device: AudioDeviceInfo?,
                mute: Bool,
                driftCompensation: Bool,
                warmupSeconds: Double,
+               sourceLevelDB: Double?,
+               micLevelDB: Double?,
                fileURL: URL) throws {
         if active != nil { throw SessionError("Already recording. Call stop_recording first.") }
-        let recorder = ProcessTapRecorder(target: target, outputDevice: device, fileURL: fileURL,
+        let recorder = ProcessTapRecorder(source: source, outputDevice: device, fileURL: fileURL,
                                           mute: mute, driftCompensation: driftCompensation,
                                           warmupSeconds: warmupSeconds)
         try recorder.start()
         recorder.equalizer.setGains(eqGains)
         recorder.equalizer.setEnabled(eqEnabled)
+        if let sourceLevelDB { recorder.setSourceGain(dB: sourceLevelDB) }
+        if let micLevelDB { recorder.setMicGain(dB: micLevelDB) }
         active = Active(recorder: recorder, fileURL: fileURL, sourceLabel: sourceLabel,
-                        deviceName: device.name, startDate: Date())
+                        deviceName: device?.name ?? "(record only)", startDate: Date())
     }
 
     /// Update EQ state; takes effect immediately if a recording is in progress.
@@ -71,7 +75,7 @@ final class RecorderSession {
 enum RecordingFiles {
     static func directory() -> URL {
         let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Music/NFL Sound Recorder", isDirectory: true)
+            .appendingPathComponent("Music/TapDeck", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

@@ -100,6 +100,17 @@ final class MCPServer {
                 return ("Error listing devices: \(error)", true)
             }
 
+        case "list_input_devices":
+            do {
+                let defaultID = try? AudioSystem.defaultInputDevice()
+                let devices = try AudioSystem.inputDevices().map {
+                    ["name": $0.name, "uid": $0.uid, "channels": $0.inputChannels, "isDefault": $0.id == defaultID] as [String: Any]
+                }
+                return (Self.json(["inputDevices": devices]), false)
+            } catch {
+                return ("Error listing input devices: \(error)", true)
+            }
+
         case "start_recording":
             return startRecording(arguments)
 
@@ -138,45 +149,85 @@ final class MCPServer {
     }
 
     private func startRecording(_ args: [String: Any]) -> (text: String, isError: Bool) {
-        // Resolve the capture target.
-        let target: ProcessTapRecorder.Target
-        let label: String
+        // Resolve the tap target (if any). `source: "microphone"` (or "none") records the
+        // mic alone — no tap.
+        var tapTarget: ProcessTapRecorder.Target?
+        var tapLabel: String?
+        let sourceArg = (args["source"] as? String)?.lowercased()
         if let pid = args["pid"] as? Int {
-            target = .pid(pid_t(pid))
-            label = NSRunningApplication(processIdentifier: pid_t(pid))?.localizedName ?? "pid \(pid)"
+            tapTarget = .pid(pid_t(pid))
+            tapLabel = NSRunningApplication(processIdentifier: pid_t(pid))?.localizedName ?? "pid \(pid)"
+        } else if sourceArg == "microphone" || sourceArg == "mic" || sourceArg == "none" {
+            tapTarget = nil
         } else {
-            let source = (args["source"] as? String) ?? "system"
-            if source.lowercased() == "system" {
-                target = .systemWide
-                label = "All System Audio"
-            } else if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == source }) {
-                target = .pid(app.processIdentifier)
-                label = app.localizedName ?? source
+            let source = sourceArg ?? "system"
+            if source == "system" {
+                tapTarget = .systemWide
+                tapLabel = "All System Audio"
+            } else if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == args["source"] as? String }) {
+                tapTarget = .pid(app.processIdentifier)
+                tapLabel = app.localizedName ?? source
             } else {
-                return ("No running application with bundle id '\(source)'. Call list_applications first.", true)
+                return ("No running application with bundle id '\(source)'. Call list_applications first, or use source 'microphone' to record the mic.", true)
             }
         }
 
-        // Resolve the output device.
-        let devices: [AudioDeviceInfo]
-        do { devices = try AudioSystem.outputDevices() } catch { return ("Error listing devices: \(error)", true) }
-        let device: AudioDeviceInfo
-        if let uid = args["output_uid"] as? String {
-            guard let match = devices.first(where: { $0.uid == uid }) else {
-                return ("No output device with uid '\(uid)'. Call list_output_devices first.", true)
+        // Resolve the microphone (if requested): "default" or an input device uid.
+        var micDevice: AudioDeviceInfo?
+        if let micArg = args["microphone"] as? String {
+            let inputs: [AudioDeviceInfo]
+            do { inputs = try AudioSystem.inputDevices() } catch { return ("Error listing input devices: \(error)", true) }
+            if micArg.lowercased() == "default" {
+                let defaultID = try? AudioSystem.defaultInputDevice()
+                guard let match = inputs.first(where: { $0.id == defaultID }) ?? inputs.first else {
+                    return ("No input devices available.", true)
+                }
+                micDevice = match
+            } else {
+                guard let match = inputs.first(where: { $0.uid == micArg }) else {
+                    return ("No input device with uid '\(micArg)'. Call list_input_devices first.", true)
+                }
+                micDevice = match
             }
-            device = match
+        }
+
+        // Combine into a capture source.
+        let captureSource: ProcessTapRecorder.Source
+        let label: String
+        switch (tapTarget, micDevice) {
+        case let (.some(t), .some(m)): captureSource = .mix(tap: t, mic: m); label = "\(tapLabel ?? "tap") + mic (\(m.name))"
+        case let (.some(t), .none):    captureSource = .tap(t); label = tapLabel ?? "tap"
+        case let (.none, .some(m)):    captureSource = .microphone(m); label = "mic (\(m.name))"
+        case (.none, .none):
+            return ("No capture source. Provide a tap (source/pid) and/or a microphone.", true)
+        }
+
+        // Resolve the output device. `output_uid: "none"` records only (no routing).
+        let device: AudioDeviceInfo?
+        if (args["output_uid"] as? String)?.lowercased() == "none" {
+            device = nil
         } else {
-            let defaultID = try? AudioSystem.defaultOutputDevice()
-            guard let match = devices.first(where: { $0.id == defaultID }) ?? devices.first else {
-                return ("No output devices available.", true)
+            let devices: [AudioDeviceInfo]
+            do { devices = try AudioSystem.outputDevices() } catch { return ("Error listing devices: \(error)", true) }
+            if let uid = args["output_uid"] as? String {
+                guard let match = devices.first(where: { $0.uid == uid }) else {
+                    return ("No output device with uid '\(uid)'. Call list_output_devices first.", true)
+                }
+                device = match
+            } else {
+                let defaultID = try? AudioSystem.defaultOutputDevice()
+                guard let match = devices.first(where: { $0.id == defaultID }) ?? devices.first else {
+                    return ("No output devices available. Pass output_uid 'none' to record only.", true)
+                }
+                device = match
             }
-            device = match
         }
 
         let mute = (args["mute"] as? Bool) ?? false
         let driftCompensation = (args["drift_compensation"] as? Bool) ?? false
         let warmupSeconds = (args["warmup_seconds"] as? Double) ?? 0.6
+        let sourceLevelDB = (args["source_level_db"] as? NSNumber)?.doubleValue
+        let micLevelDB = (args["mic_level_db"] as? NSNumber)?.doubleValue
         // Confined to the recordings directory — a client can choose a filename,
         // not an arbitrary path.
         let fileURL: URL = (args["file_path"] as? String).map {
@@ -184,11 +235,11 @@ final class MCPServer {
         } ?? RecordingFiles.newURL()
 
         do {
-            try session.start(target: target, sourceLabel: label, device: device, mute: mute,
+            try session.start(source: captureSource, sourceLabel: label, device: device, mute: mute,
                               driftCompensation: driftCompensation, warmupSeconds: warmupSeconds,
-                              fileURL: fileURL)
+                              sourceLevelDB: sourceLevelDB, micLevelDB: micLevelDB, fileURL: fileURL)
             return (Self.json([
-                "started": true, "source": label, "device": device.name, "mute": mute,
+                "started": true, "source": label, "device": device?.name ?? "(record only)", "mute": mute,
                 "driftCompensation": driftCompensation, "file": fileURL.path,
             ]), false)
         } catch {
@@ -212,18 +263,26 @@ final class MCPServer {
             "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
         [
+            "name": "list_input_devices",
+            "description": "List available audio input devices (microphones) that can be captured. Each entry has name, uid, channels, and isDefault. Re-enumerated live on every call.",
+            "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
+        ],
+        [
             "name": "start_recording",
-            "description": "Start capturing audio to a file while routing it to an output device. Records one source at a time.",
+            "description": "Start capturing audio to a file while optionally routing it to an output device. Can capture a process/system tap, the microphone, or BOTH mixed together (source + microphone) into one file with independent per-feed levels.",
             "inputSchema": [
                 "type": "object",
                 "properties": [
-                    "source": stringProp("'system' for all system audio, or an application bundle id from list_applications. Defaults to 'system'."),
+                    "source": stringProp("'system' for all system audio, an application bundle id from list_applications, or 'microphone' to record the mic alone. Defaults to 'system'."),
                     "pid": ["type": "integer", "description": "Optional process id to capture, overriding 'source'."],
-                    "output_uid": stringProp("UID of the output device from list_output_devices. Defaults to the current default output."),
+                    "microphone": stringProp("Also capture a microphone and MIX it in: 'default' for the default input, or an input device uid from list_input_devices. Combine with a tap source for system+mic; omit for tap-only."),
+                    "source_level_db": ["type": "number", "description": "Tap/system feed level in dB (0 = unity). Use with mic_level_db to balance a mix."],
+                    "mic_level_db": ["type": "number", "description": "Microphone feed level in dB (0 = unity). Use with source_level_db to balance a mix."],
+                    "output_uid": stringProp("UID of the output device from list_output_devices, or 'none' to record only (no routing). Defaults to the current default output. Tip: with a microphone, prefer 'none' or headphones to avoid feedback."),
                     "mute": ["type": "boolean", "description": "If true, mute the source's normal output so only the routed copy is heard (reroute). Default false."],
                     "drift_compensation": ["type": "boolean", "description": "Resample the tap to the output clock. Default false; enabling can add a brief level ramp at the start."],
                     "warmup_seconds": ["type": "number", "description": "Hold off file-writing this long to skip Core Audio's device-start volume ramp. Default 0.6; use 0 to keep the raw ramp."],
-                    "file_path": stringProp("Optional filename for the recording. Only the filename is used; writes are confined to ~/Music/NFL Sound Recorder/."),
+                    "file_path": stringProp("Optional filename for the recording. Only the filename is used; writes are confined to ~/Music/TapDeck/."),
                 ],
                 "additionalProperties": false,
             ],

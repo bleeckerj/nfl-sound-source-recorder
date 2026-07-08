@@ -5,13 +5,13 @@
 # permission prompt — and process taps then return SILENCE. Run the bundled inner
 # binary (it still behaves like a normal CLI, just with a usage string next to it):
 #
-#   "dist/NFL Sound Recorder CLI.app/Contents/MacOS/nfl-sound-recorder" --system --file ~/rec.caf
+#   "dist/TapDeck CLI.app/Contents/MacOS/nfl-sound-recorder" --system --file ~/rec.caf
 #
 set -euo pipefail
 
 CONFIG="release"
-APP_NAME="NFL Sound Recorder CLI"
-BUNDLE_ID="com.nfl.soundrecorder.cli"
+APP_NAME="TapDeck CLI"
+BUNDLE_ID="com.nfl.tapdeck.cli"
 EXECUTABLE="nfl-sound-recorder"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -39,7 +39,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key>           <string>1</string>
     <key>LSMinimumSystemVersion</key>    <string>14.4</string>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>NFL Sound Recorder captures audio from the apps you choose so it can record and route it.</string>
+    <string>TapDeck captures audio from the apps you choose so it can record and route it.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>TapDeck records your microphone, on its own or mixed into the captured app/system audio.</string>
 </dict>
 </plist>
 PLIST

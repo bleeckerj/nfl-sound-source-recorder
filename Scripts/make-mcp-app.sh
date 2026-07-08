@@ -7,13 +7,13 @@
 #   • LSBackgroundOnly (no Dock icon, no UI)
 #
 # Point your MCP client at the inner executable:
-#   dist/NFL Sound Recorder MCP.app/Contents/MacOS/nfl-sound-recorder-mcp
+#   dist/TapDeck MCP.app/Contents/MacOS/nfl-sound-recorder-mcp
 #
 set -euo pipefail
 
 CONFIG="release"
-APP_NAME="NFL Sound Recorder MCP"
-BUNDLE_ID="com.nfl.soundrecorder.mcp"
+APP_NAME="TapDeck MCP"
+BUNDLE_ID="com.nfl.tapdeck.mcp"
 EXECUTABLE="nfl-sound-recorder-mcp"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -43,7 +43,9 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
     <key>LSMinimumSystemVersion</key>    <string>14.4</string>
     <key>LSBackgroundOnly</key>          <true/>
     <key>NSAudioCaptureUsageDescription</key>
-    <string>NFL Sound Recorder MCP captures audio from the apps you choose so it can record and route it.</string>
+    <string>TapDeck MCP captures audio from the apps you choose so it can record and route it.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>TapDeck MCP records your microphone, on its own or mixed into the captured app/system audio.</string>
 </dict>
 </plist>
 PLIST
