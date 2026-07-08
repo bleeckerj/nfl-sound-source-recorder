@@ -2,8 +2,13 @@
 #
 # Builds the menu bar executable and wraps it in a proper .app bundle:
 #   • Info.plist with LSUIElement (menu-bar only, no Dock icon)
-#   • NSAudioCaptureUsageDescription so macOS can grant Audio Recording permission
-#   • ad-hoc code signature (fine for local/dev use)
+#   • NSAudioCaptureUsageDescription / NSMicrophoneUsageDescription for the prompts
+#   • Developer ID signature + Hardened Runtime + entitlements when a Developer ID
+#     Application cert is present (required for notarization / distribution); falls
+#     back to an ad-hoc signature for local dev on machines without the cert.
+#
+# Override the identity with SIGN_IDENTITY="Developer ID Application: …".
+# For a notarized, stapled DMG to hand to others, run Scripts/release-app.sh.
 #
 # Output: dist/TapDeck.app
 #
@@ -58,8 +63,25 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 
-echo "▸ Code signing (ad-hoc)…"
-codesign --force --sign - "$APP_DIR"
+ENTITLEMENTS="$ROOT/Scripts/TapDeck.entitlements"
+# Prefer a Developer ID Application identity (auto-detected, overridable via
+# SIGN_IDENTITY). Fall back to ad-hoc so a fresh clone without the cert still builds.
+IDENTITY="${SIGN_IDENTITY:-$(security find-identity -v -p codesigning 2>/dev/null \
+    | awk -F'"' '/Developer ID Application/{print $2; exit}')}"
+
+if [ -n "$IDENTITY" ]; then
+    echo "▸ Code signing (Developer ID + Hardened Runtime)…"
+    echo "  identity: $IDENTITY"
+    codesign --force --options runtime --timestamp \
+        --entitlements "$ENTITLEMENTS" \
+        --sign "$IDENTITY" "$APP_DIR"
+else
+    echo "▸ Code signing (ad-hoc — no Developer ID Application cert found)…"
+    codesign --force --entitlements "$ENTITLEMENTS" --sign - "$APP_DIR"
+fi
+
+echo "▸ Verifying signature…"
+codesign --verify --strict --verbose=2 "$APP_DIR"
 
 echo "✓ Built: $APP_DIR"
 echo

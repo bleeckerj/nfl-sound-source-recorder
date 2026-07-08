@@ -171,6 +171,37 @@ While recording, the CLI prints the capture format and a **live level meter**. I
 
 **One-command check:** `./Scripts/test-recording.sh` builds the bundled CLI, plays a known sound, captures 6 seconds of system audio, and reports whether any signal was captured (writes to `/tmp/nfl-test.caf`). Use `--duration <sec>` for your own hands-free timed captures.
 
+## Distribution (signing & notarization)
+
+To hand the menu-bar app to other people, it needs a Developer ID signature, the
+Hardened Runtime, and Apple notarization — otherwise Gatekeeper blocks it on their Macs.
+
+`make-app.sh` handles the signing automatically: if a **Developer ID Application**
+certificate is in your keychain it signs with it under the Hardened Runtime, applying
+[`Scripts/TapDeck.entitlements`](Scripts/TapDeck.entitlements) (just the microphone —
+system-audio recording is runtime TCC consent, not an entitlement). Without that cert it
+falls back to an ad-hoc signature so a fresh clone still builds. Override with
+`SIGN_IDENTITY="Developer ID Application: …"`.
+
+For a **notarized, stapled `.dmg`** ready to download, run [`Scripts/release-app.sh`](Scripts/release-app.sh):
+
+```sh
+# one-time: store notarization credentials under a profile name
+xcrun notarytool store-credentials "tapdeck" \
+    --apple-id "you@example.com" --team-id 9DCTLJ9BY7 --password "app-specific-password"
+
+# build → notarize the app → staple → build DMG → notarize + staple the DMG → verify
+NOTARY_PROFILE="tapdeck" ./Scripts/release-app.sh
+```
+
+It staples both the app and the DMG (so first launch works offline) and verifies with
+`spctl`/`stapler`. The output `dist/TapDeck-<version>.dmg` passes Gatekeeper cleanly.
+A stable Developer ID signature also fixes the ad-hoc build's re-prompt-every-rebuild
+behaviour — the TCC grants stick across rebuilds.
+
+> Requires the full-Xcode toolchain to be license-accepted (`sudo xcodebuild -license accept`),
+> since notarization uses `notarytool` from Xcode.
+
 ## Known limitations (it's a POC)
 
 - **Format matching:** the routing `memcpy` assumes the tap and output device share channel count / sample rate (true for the common stereo case). A shipping app would run frames through an `AVAudioConverter` when they differ.

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Hardened-runtime entitlements for TapDeck (Developer ID, non-sandboxed).
+
+      Microphone: required under the hardened runtime to record any input device.
+      System-audio recording (Core Audio process taps) is NOT an entitlement — it is
+      runtime TCC consent shown under "Screen & System Audio Recording", gated by the
+      NSAudioCaptureUsageDescription string and the app's (stable) code signature.
+
+      No library-validation exception is needed: the only dlopen is of Apple's private
+      TCC.framework (see AudioCapturePermission), which is Apple-signed.
+    -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+</dict>
+</plist>
