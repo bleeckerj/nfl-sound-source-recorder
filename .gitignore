@@ -1,11 +1,21 @@
 # SwiftPM build artifacts
 .build/
+.swiftpm/
 
 # Built app bundles / distribution output
 dist/
 
 # Runtime logs
 logs/
+*.log
+
+# Xcode (if the package is opened there)
+*.xcuserstate
+xcuserdata/
+DerivedData/
+
+# Claude Code local machine settings (permissions etc.)
+.claude/settings.local.json
 
 # macOS
 .DS_Store
