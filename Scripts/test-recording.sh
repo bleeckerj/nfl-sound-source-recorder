@@ -8,7 +8,7 @@
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CLI="$ROOT/dist/NFL Sound Recorder CLI.app/Contents/MacOS/nfl-sound-recorder"
+CLI="$ROOT/dist/TapDeck CLI.app/Contents/MacOS/nfl-sound-recorder"
 OUT="/tmp/nfl-test.caf"
 SOUND="/System/Library/Sounds/Ping.aiff"
 

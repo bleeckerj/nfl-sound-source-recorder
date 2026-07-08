@@ -8,7 +8,13 @@ struct RecordingVisualizerView: View {
 
     var body: some View {
         VStack(spacing: 8) {
-            CassetteView(elapsed: controller.elapsedText, angle: controller.iconAngle)
+            CassetteView(elapsed: controller.elapsedText,
+                         angle: controller.iconAngle,
+                         isRecording: controller.isRecording,
+                         isPaused: controller.isPaused)
+
+            // Physical transport keys — the primary record controls.
+            DeckTransport(controller: controller)
 
             TransportSelector(mode: $controller.vizMode)
 
@@ -16,7 +22,7 @@ struct RecordingVisualizerView: View {
             case .bars:
                 LEDSpectrumView(levels: controller.bandLevels, peaks: controller.bandPeaks)
             case .scope:
-                LissajousView(left: controller.scopeLeft, right: controller.scopeRight)
+                ScopeWaveformView(left: controller.scopeLeft, right: controller.scopeRight)
             }
         }
         .padding(10)
@@ -86,14 +92,100 @@ struct TransportKey: View {
     }
 }
 
-// MARK: - Lissajous vectorscope
+// MARK: - Tape-deck transport controls (Record / Pause / Stop)
 
-/// Lissajous / goniometer display: plots the stereo field as an X-Y phase trace
-/// (not a time-domain waveform). Left and right are rotated 45° so a mono signal
-/// draws a vertical line, hard-panned content leans along the L/R diagonals, and
-/// stereo width opens the figure horizontally. Peak-normalized every frame so *any*
-/// audible signal fills the screen regardless of absolute level — quiet or cranked.
-struct LissajousView: View {
+/// The main recording controls, styled as a physical deck's mechanical transport
+/// keys. Keys latch down when engaged (REC while recording, PAUSE while paused) and
+/// pop back up on STOP — mirroring how a real cassette deck's interlocked keys move.
+struct DeckTransport: View {
+    @ObservedObject var controller: RecordingController
+
+    private let recRed = Color(red: 1.0, green: 0.25, blue: 0.2)
+    private let amber = Color(red: 1.0, green: 0.72, blue: 0.2)
+
+    var body: some View {
+        HStack(spacing: 8) {
+            DeckButton(systemImage: "record.circle.fill", label: "REC", tint: recRed,
+                       engaged: controller.isRecording && !controller.isPaused,
+                       enabled: !controller.isRecording) {
+                controller.start()
+            }
+            DeckButton(systemImage: "pause.fill", label: "PAUSE", tint: amber,
+                       engaged: controller.isPaused,
+                       enabled: controller.isRecording) {
+                controller.togglePause()
+            }
+            DeckButton(systemImage: "stop.fill", label: "STOP", tint: Color(white: 0.85),
+                       engaged: !controller.isRecording,
+                       enabled: controller.isRecording) {
+                controller.stop()
+            }
+        }
+    }
+}
+
+/// A single chunky, piano-key style transport button. `engaged` latches it into the
+/// pressed-down state with a lit indicator; `enabled` gates whether it can be pressed.
+struct DeckButton: View {
+    let systemImage: String
+    let label: String
+    let tint: Color
+    let engaged: Bool
+    let enabled: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 3) {
+                // Status LED — lit in the button's tint while engaged.
+                Circle()
+                    .fill(engaged ? tint : Color(white: 0.24))
+                    .frame(width: 5, height: 5)
+                    .shadow(color: engaged ? tint.opacity(0.9) : .clear, radius: 3)
+                Image(systemName: systemImage)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(engaged ? tint : Color(white: 0.78))
+                    .shadow(color: engaged ? tint.opacity(0.7) : .clear, radius: 3)
+                Text(label)
+                    .font(.system(size: 8, weight: .bold, design: .monospaced))
+                    .foregroundStyle(engaged ? tint.opacity(0.9) : Color(white: 0.5))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .background(keycap)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.5)
+    }
+
+    // Raised plastic key that visually depresses (inset, darker) when engaged.
+    private var keycap: some View {
+        RoundedRectangle(cornerRadius: 6)
+            .fill(LinearGradient(
+                colors: engaged ? [Color(white: 0.09), Color(white: 0.17)]   // pressed in
+                                : [Color(white: 0.36), Color(white: 0.23)],  // raised
+                startPoint: .top, endPoint: .bottom))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(.white.opacity(engaged ? 0.04 : 0.16), lineWidth: 0.5))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6)
+                    .strokeBorder(.black.opacity(0.6), lineWidth: 0.5).blur(radius: 0.5))
+            .shadow(color: engaged ? .clear : .black.opacity(0.5),
+                    radius: engaged ? 0 : 2, y: engaged ? 0 : 1.5)
+    }
+}
+
+// MARK: - Oscilloscope
+
+/// Time-domain oscilloscope: traces the actual waveform (the mono sum of the stereo
+/// pair) left-to-right, phosphor-green like a bench scope. Unlike a goniometer this
+/// stays lively for mono/voice content — the common case here — which on a phase
+/// display would collapse to a flat horizontal line. Peak-normalized every frame so
+/// any audible signal fills the height regardless of absolute level.
+struct ScopeWaveformView: View {
     let left: [Float]
     let right: [Float]
 
@@ -103,34 +195,41 @@ struct LissajousView: View {
     var body: some View {
         Canvas { ctx, size in
             let w = size.width, h = size.height
-            let cx = w / 2, cy = h / 2
-            let r = min(w, h) / 2 - 2        // square plotting radius
+            let cy = h / 2
+            let amp = h / 2 - 3   // vertical headroom for the trace
 
-            // Graticule: crosshair through the middle marking the L/R + mono axes.
+            // Graticule: a horizontal baseline plus a few vertical divisions.
             var grid = Path()
-            grid.move(to: CGPoint(x: cx, y: cy - r)); grid.addLine(to: CGPoint(x: cx, y: cy + r))
-            grid.move(to: CGPoint(x: cx - r, y: cy)); grid.addLine(to: CGPoint(x: cx + r, y: cy))
+            grid.move(to: CGPoint(x: 0, y: cy)); grid.addLine(to: CGPoint(x: w, y: cy))
+            for d in 1..<4 {
+                let x = w * CGFloat(d) / 4
+                grid.move(to: CGPoint(x: x, y: 0)); grid.addLine(to: CGPoint(x: x, y: h))
+            }
             ctx.stroke(grid, with: .color(.white.opacity(0.10)), lineWidth: 1)
 
             let n = min(left.count, right.count)
-            guard n > 1 else { return }
 
-            // Peak-normalize across both channels. The rotated sum/diff can reach
-            // √2·peak, so divide that out to keep the figure inside the graticule.
+            // Mono sum drives the trace; peak-normalize so quiet passages still fill the
+            // height. Below the floor we hold a flat baseline (a resting scope) rather
+            // than amplifying noise to full screen.
             var peak: Float = 0
-            for i in 0..<n { peak = max(peak, max(abs(left[i]), abs(right[i]))) }
-            guard peak > 0.0002 else { return } // effectively silent → just the crosshair
-            let norm = CGFloat(0.92) * r / (CGFloat(peak) * CGFloat(2.0).squareRoot())
+            for i in 0..<n { peak = max(peak, abs((left[i] + right[i]) * 0.5)) }
 
-            // Rotate 45°: x = (L − R), y = (L + R). Mono (L=R) → vertical line.
+            func baseline() {
+                var line = Path()
+                line.move(to: CGPoint(x: 0, y: cy)); line.addLine(to: CGPoint(x: w, y: cy))
+                ctx.stroke(line, with: .color(green.opacity(0.55)), lineWidth: 1)
+            }
+            guard n > 1, peak > 0.0002 else { baseline(); return }
+
+            let norm = CGFloat(0.92) * amp / CGFloat(peak)
             var path = Path()
-            var first = true
             for i in 0..<n {
-                let l = CGFloat(left[i]), rr = CGFloat(right[i])
-                let x = cx + (l - rr) * norm
-                let y = cy - (l + rr) * norm
-                let pt = CGPoint(x: x, y: y)
-                if first { path.move(to: pt); first = false } else { path.addLine(to: pt) }
+                let s = CGFloat((left[i] + right[i]) * 0.5)
+                let x = w * CGFloat(i) / CGFloat(n - 1)
+                let y = cy - s * norm
+                if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
+                else { path.addLine(to: CGPoint(x: x, y: y)) }
             }
             // Layered strokes: cyan halo → green mid → bright green core (phosphor look).
             ctx.stroke(path, with: .color(cyan.opacity(0.18)), lineWidth: 5)
@@ -204,6 +303,20 @@ struct LEDSpectrumView: View {
 struct CassetteView: View {
     let elapsed: String
     let angle: Double
+    var isRecording: Bool = false
+    var isPaused: Bool = false
+
+    // Indicator lamp + label reflect the transport state.
+    private var lampColor: Color {
+        if isPaused { return Color(red: 1.0, green: 0.72, blue: 0.2) }   // amber
+        if isRecording { return .red }
+        return Color(white: 0.35)                                        // idle: dark
+    }
+    private var statusWord: String {
+        if isPaused { return "PAUSE" }
+        if isRecording { return "REC" }
+        return "STOP"
+    }
 
     var body: some View {
         ZStack {
@@ -222,9 +335,9 @@ struct CassetteView: View {
                                                       Color(red: 0.82, green: 0.75, blue: 0.55)],
                                              startPoint: .top, endPoint: .bottom))
                     HStack(spacing: 6) {
-                        Circle().fill(.red).frame(width: 6, height: 6)
-                            .shadow(color: .red.opacity(0.8), radius: 2)
-                        Text("REC \(elapsed)")
+                        Circle().fill(lampColor).frame(width: 6, height: 6)
+                            .shadow(color: isRecording && !isPaused ? lampColor.opacity(0.8) : .clear, radius: 2)
+                        Text("\(statusWord) \(elapsed)")
                             .font(.system(size: 9, weight: .semibold, design: .monospaced))
                             .foregroundStyle(.black.opacity(0.75))
                         Spacer()
@@ -319,11 +432,17 @@ struct ReelHub: View {
 
 // MARK: - Menu-bar icon
 
-/// Compact cassette for the menu bar: reels spin while recording, static otherwise.
+/// Compact cassette for the menu bar. While recording the reels spin at a steady rate
+/// (like real tape transport) and the hub pulses with the live level, so the icon
+/// reads as a level meter the way battery/wifi/bandwidth indicators do. Static idle.
 /// Rendered to a template NSImage (see MenuBarIconRenderer) rather than used directly.
 struct MenuBarCassetteIcon: View {
     var isRecording: Bool
     var angle: Double
+    /// Live audio level (0...1); ignored when not recording.
+    var level: Double = 0
+
+    private var activeLevel: Double { isRecording ? max(0, min(1, level)) : 0 }
 
     var body: some View {
         ZStack {
@@ -339,8 +458,12 @@ struct MenuBarCassetteIcon: View {
     }
 
     private var reel: some View {
-        ZStack {
+        // Hub swells from a thin ring toward a filled disc as the level rises — the
+        // "how much signal" cue — while the spokes carry the spin.
+        let hub = 1.8 + activeLevel * 2.6
+        return ZStack {
             Circle().stroke(Color.black, lineWidth: 1).frame(width: 6, height: 6)
+            Circle().fill(Color.black).frame(width: hub, height: hub)
             ForEach(0..<3, id: \.self) { i in
                 Rectangle().fill(Color.black)
                     .frame(width: 1.2, height: 2.6)
@@ -353,9 +476,9 @@ struct MenuBarCassetteIcon: View {
 /// Rasterizes `MenuBarCassetteIcon` into a template NSImage for the menu bar.
 @MainActor
 enum MenuBarIconRenderer {
-    static func image(isRecording: Bool, angle: Double) -> NSImage {
+    static func image(isRecording: Bool, angle: Double, level: Double = 0) -> NSImage {
         let renderer = ImageRenderer(content:
-            MenuBarCassetteIcon(isRecording: isRecording, angle: angle)
+            MenuBarCassetteIcon(isRecording: isRecording, angle: angle, level: level)
                 .frame(width: 20, height: 13)
                 .padding(1)
         )
