@@ -164,11 +164,11 @@ final class MCPServer {
             if source == "system" {
                 tapTarget = .systemWide
                 tapLabel = "All System Audio"
-            } else if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == args["source"] as? String }) {
-                tapTarget = .pid(app.processIdentifier)
-                tapLabel = app.localizedName ?? source
+            } else if let app = AudioProcesses.bestMatch(bundleID: args["source"] as? String ?? source) {
+                tapTarget = .pid(app.pid)
+                tapLabel = app.name
             } else {
-                return ("No running application with bundle id '\(source)'. Call list_applications first, or use source 'microphone' to record the mic.", true)
+                return ("No audio-capable process with bundle id '\(source)'. Start playback, call list_applications again, or use source 'microphone' to record the mic.", true)
             }
         }
 

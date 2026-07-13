@@ -130,15 +130,13 @@ final class RecordingController: ObservableObject {
                 makeTarget: { nil }
             )
         ]
-        let apps = NSWorkspace.shared.runningApplications
-            .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
-            .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
-        for app in apps {
-            let pid = app.processIdentifier
+        for app in AudioProcesses.list() {
+            let pid = app.pid
+            let icon = NSRunningApplication(processIdentifier: pid)?.icon
             options.append(SourceOption(
-                id: app.bundleIdentifier ?? "pid:\(pid)",
-                label: app.localizedName ?? "(unknown)",
-                icon: app.icon,
+                id: "\(app.bundleID):\(pid)",
+                label: app.isPlaying ? "\(app.name) — playing" : app.name,
+                icon: icon,
                 makeTarget: { .pid(pid) }
             ))
         }

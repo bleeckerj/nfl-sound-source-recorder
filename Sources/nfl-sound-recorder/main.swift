@@ -64,13 +64,10 @@ func printUsage() {
 
 func listEverything() {
     print("Running apps with audio-capable processes:")
-    let apps = NSWorkspace.shared.runningApplications
-        .filter { $0.activationPolicy == .regular && $0.bundleIdentifier != nil }
-        .sorted { ($0.localizedName ?? "") < ($1.localizedName ?? "") }
+    let apps = AudioProcesses.list()
     for app in apps {
-        let name = app.localizedName ?? "(unknown)"
-        let bundle = app.bundleIdentifier ?? "?"
-        print("  pid \(String(app.processIdentifier).padding(toLength: 6, withPad: " ", startingAt: 0))  \(name)  [\(bundle)]")
+        let state = app.isPlaying ? "playing" : "idle"
+        print("  pid \(String(app.pid).padding(toLength: 6, withPad: " ", startingAt: 0))  \(app.name)  [\(app.bundleID)]  \(state)")
     }
 
     print("\nOutput devices:")
@@ -102,10 +99,10 @@ func resolveTarget() -> ProcessTapRecorder.Target? {
     if hasFlag("--system") { return .systemWide }
     if let pidStr = argValue("--pid"), let pid = pid_t(pidStr) { return .pid(pid) }
     if let bundle = argValue("--app") {
-        if let app = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier == bundle }) {
-            return .pid(app.processIdentifier)
+        if let app = AudioProcesses.bestMatch(bundleID: bundle) {
+            return .pid(app.pid)
         }
-        FileHandle.standardError.write("No running app with bundle id \(bundle)\n".data(using: .utf8)!)
+        FileHandle.standardError.write("No audio-capable process with bundle id \(bundle). Start playback and run --list again.\n".data(using: .utf8)!)
         return nil
     }
     return nil

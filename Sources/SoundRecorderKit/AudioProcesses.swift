@@ -50,4 +50,13 @@ public enum AudioProcesses {
             ($0.isPlaying ? 0 : 1, $0.name.lowercased()) < ($1.isPlaying ? 0 : 1, $1.name.lowercased())
         }
     }
+
+    /// Resolve a bundle id to the best Core Audio process. Browser-style apps often
+    /// render audio from helper processes, so prefer the process Core Audio says is
+    /// actively producing output over the parent NSWorkspace application process.
+    public static func bestMatch(bundleID: String) -> AudioProcessInfo? {
+        let candidates = list()
+        return candidates.first { $0.bundleID == bundleID || $0.bundleID.hasPrefix("\(bundleID).") }
+            ?? candidates.first { bundleID.hasPrefix("\($0.bundleID).") }
+    }
 }
