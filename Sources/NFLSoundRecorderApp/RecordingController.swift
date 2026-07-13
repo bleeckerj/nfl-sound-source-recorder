@@ -133,15 +133,33 @@ final class RecordingController: ObservableObject {
         for app in AudioProcesses.list() {
             let pid = app.pid
             let icon = NSRunningApplication(processIdentifier: pid)?.icon
+            let label = Self.sourceLabel(for: app)
             options.append(SourceOption(
                 id: "\(app.bundleID):\(pid)",
-                label: app.isPlaying ? "\(app.name) — playing" : app.name,
+                label: label,
                 icon: icon,
-                makeTarget: { .pid(pid) }
+                makeTarget: {
+                    let targetPID = AudioProcesses.bestMatch(bundleID: app.bundleID)?.pid ?? pid
+                    return .pid(targetPID)
+                }
             ))
         }
         sources = options
         if !sources.contains(where: { $0.id == selectedSourceID }) { selectedSourceID = "system" }
+    }
+
+    private static func sourceLabel(for app: AudioProcessInfo) -> String {
+        let name = app.name == app.bundleID ? friendlyBundleName(app.bundleID) : app.name
+        let state = app.isPlaying ? "playing" : "idle - no signal now"
+        return "\(name) - \(state) (pid \(app.pid))"
+    }
+
+    private static func friendlyBundleName(_ bundleID: String) -> String {
+        let parts = bundleID.split(separator: ".").map(String.init)
+        if parts.count >= 2, parts.last?.lowercased() == "helper" {
+            return "\(parts[parts.count - 2]) Helper"
+        }
+        return parts.last ?? bundleID
     }
 
     /// The microphone device currently selected, or nil for "off".
