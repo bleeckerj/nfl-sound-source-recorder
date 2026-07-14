@@ -108,6 +108,14 @@ final class RecordingController: ObservableObject {
     private var recordingHasMic = false
 
     init() {
+        // Warm up the Core Audio HAL on the MAIN thread. The HAL's one-time bootstrap
+        // (HALSystem::InitializeDevices) must run on the main thread's run loop; if the very
+        // first HAL access instead happens on a background queue — as our off-main `refresh()`
+        // enumeration otherwise would — it deadlocks in semaphore_wait and the device/source
+        // lists never populate. Touching it once here (init runs on the main actor at launch)
+        // guarantees all later off-main enumeration/teardown hits an already-initialized HAL.
+        _ = try? AudioSystem.defaultOutputDevice()
+
         // Restore persisted preferences. (Assignments in init don't fire the didSet
         // observers, so this loads without immediately re-saving.)
         let d = UserDefaults.standard
