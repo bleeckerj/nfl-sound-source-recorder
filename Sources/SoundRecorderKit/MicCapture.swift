@@ -128,8 +128,11 @@ final class MicCapture {
 
     func stop() {
         if deviceID != 0, let procID {
-            AudioDeviceStop(deviceID, procID)
-            AudioDeviceDestroyIOProcID(deviceID, procID)
+            let id = deviceID
+            CA.withTimeout(context: "AudioDeviceStop (mic)") {
+                AudioDeviceStop(id, procID)
+                AudioDeviceDestroyIOProcID(id, procID)
+            }
         }
         deviceID = 0
         procID = nil

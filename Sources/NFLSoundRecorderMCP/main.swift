@@ -228,19 +228,32 @@ final class MCPServer {
         let warmupSeconds = (args["warmup_seconds"] as? Double) ?? 0.6
         let sourceLevelDB = (args["source_level_db"] as? NSNumber)?.doubleValue
         let micLevelDB = (args["mic_level_db"] as? NSNumber)?.doubleValue
+        // Output codec: AAC (~1 MB/min) by default; an unknown value is a hard error so a
+        // typo doesn't silently fall back to a huge lossless file.
+        let format: RecordingFormat
+        if let raw = args["format"] as? String {
+            guard let f = RecordingFormat(rawValue: raw.lowercased()) else {
+                let choices = RecordingFormat.allCases.map(\.rawValue).joined(separator: ", ")
+                return ("Unknown format \"\(raw)\". Choose one of: \(choices).", true)
+            }
+            format = f
+        } else {
+            format = .aac
+        }
         // Confined to the recordings directory — a client can choose a filename,
-        // not an arbitrary path.
+        // not an arbitrary path. The extension is forced to match the codec.
         let fileURL: URL = (args["file_path"] as? String).map {
-            RecordingFiles.confinedURL(forRequestedPath: $0)
-        } ?? RecordingFiles.newURL()
+            RecordingFiles.confinedURL(forRequestedPath: $0, format: format)
+        } ?? RecordingFiles.newURL(format: format)
 
         do {
             try session.start(source: captureSource, sourceLabel: label, device: device, mute: mute,
                               driftCompensation: driftCompensation, warmupSeconds: warmupSeconds,
-                              sourceLevelDB: sourceLevelDB, micLevelDB: micLevelDB, fileURL: fileURL)
+                              sourceLevelDB: sourceLevelDB, micLevelDB: micLevelDB,
+                              format: format, fileURL: fileURL)
             return (Self.json([
                 "started": true, "source": label, "device": device?.name ?? "(record only)", "mute": mute,
-                "driftCompensation": driftCompensation, "file": fileURL.path,
+                "driftCompensation": driftCompensation, "format": format.rawValue, "file": fileURL.path,
             ]), false)
         } catch {
             return ("Failed to start recording: \(error)", true)
@@ -282,7 +295,8 @@ final class MCPServer {
                     "mute": ["type": "boolean", "description": "If true, mute the source's normal output so only the routed copy is heard (reroute). Default false."],
                     "drift_compensation": ["type": "boolean", "description": "Resample the tap to the output clock. Default false; enabling can add a brief level ramp at the start."],
                     "warmup_seconds": ["type": "number", "description": "Hold off file-writing this long to skip Core Audio's device-start volume ramp. Default 0.6; use 0 to keep the raw ramp."],
-                    "file_path": stringProp("Optional filename for the recording. Only the filename is used; writes are confined to ~/Music/TapDeck/."),
+                    "format": stringProp("Output codec: aac (default, ~1 MB/min, lossy), or lossless caf/wav/aiff/alac/flac (caf ~90 MB/min). macOS has no MP3 encoder — use aac."),
+                    "file_path": stringProp("Optional filename for the recording. Only the filename is used (its extension is replaced to match the format); writes are confined to ~/Music/TapDeck/."),
                 ],
                 "additionalProperties": false,
             ],

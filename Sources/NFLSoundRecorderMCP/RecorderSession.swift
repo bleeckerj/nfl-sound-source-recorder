@@ -26,10 +26,11 @@ final class RecorderSession {
                warmupSeconds: Double,
                sourceLevelDB: Double?,
                micLevelDB: Double?,
+               format: RecordingFormat,
                fileURL: URL) throws {
         if active != nil { throw SessionError("Already recording. Call stop_recording first.") }
         let recorder = ProcessTapRecorder(source: source, outputDevice: device, fileURL: fileURL,
-                                          mute: mute, driftCompensation: driftCompensation,
+                                          format: format, mute: mute, driftCompensation: driftCompensation,
                                           warmupSeconds: warmupSeconds)
         try recorder.start()
         recorder.equalizer.setGains(eqGains)
@@ -80,17 +81,21 @@ enum RecordingFiles {
         return dir
     }
 
-    static func newURL() -> URL {
+    static func newURL(format: RecordingFormat = .aac) -> URL {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        return directory().appendingPathComponent("Recording \(formatter.string(from: Date())).caf")
+        return directory().appendingPathComponent("Recording \(formatter.string(from: Date())).\(format.fileExtension)")
     }
 
-    /// Reduce any client-supplied path to a safe filename inside `directory()`.
-    static func confinedURL(forRequestedPath path: String) -> URL {
+    /// Reduce any client-supplied path to a safe filename inside `directory()`, with the
+    /// extension forced to match the chosen codec.
+    static func confinedURL(forRequestedPath path: String, format: RecordingFormat = .aac) -> URL {
+        let ext = format.fileExtension
         var name = (path as NSString).lastPathComponent
-        if name.isEmpty || name == "/" || name == "." || name == ".." { name = "Recording.caf" }
-        if !name.lowercased().hasSuffix(".caf") { name += ".caf" }
-        return directory().appendingPathComponent(name)
+        if name.isEmpty || name == "/" || name == "." || name == ".." { name = "Recording" }
+        // Drop any client-supplied extension and apply the codec's own.
+        name = (name as NSString).deletingPathExtension
+        if name.isEmpty { name = "Recording" }
+        return directory().appendingPathComponent("\(name).\(ext)")
     }
 }

@@ -43,10 +43,10 @@ func printUsage() {
       --no-route        Record only — a tap-only aggregate, no output device, nothing
                         plays out (null sink). Overrides --out.
       --file <path>     Output file path (default: ./recording-<timestamp>.<ext>).
-      --format <fmt>    Recording format: caf, wav, aiff, aac, alac, flac (default: caf).
-                        caf/wav/aiff/alac/flac are lossless; aac is lossy (small files).
-                        If omitted but --file has a known extension, the format is
-                        inferred from it. macOS has no MP3 encoder — use aac instead.
+      --format <fmt>    Recording format: caf, wav, aiff, aac, alac, flac (default: aac).
+                        aac is lossy (~1 MB/min, the small default); caf/wav/aiff/alac/flac
+                        are lossless (caf ~90 MB/min). If omitted but --file has a known
+                        extension, the format is inferred. macOS has no MP3 encoder — use aac.
       --mute            Silence the app's normal output so only the routed copy is heard.
       --eq <g0,..,g9>   Enable the 10-band EQ with per-band gains in dB, low→high
                         (32,64,125,250,500,1k,2k,4k,8k,16k Hz). e.g. --eq 6,4,0,0,0,0,0,3,5,5
@@ -280,7 +280,7 @@ func targetLabel(_ t: ProcessTapRecorder.Target) -> String {
 }
 
 // Resolve format: explicit --format wins; otherwise infer from --file's extension;
-// otherwise default to CAF. An unknown --format value is a hard error.
+// otherwise default to AAC (small files). An unknown --format value is a hard error.
 let format: RecordingFormat = {
     if let raw = argValue("--format") {
         guard let f = RecordingFormat(rawValue: raw.lowercased()) else {
@@ -294,7 +294,7 @@ let format: RecordingFormat = {
        let inferred = RecordingFormat(fileExtension: (path as NSString).pathExtension) {
         return inferred
     }
-    return .caf
+    return .aac
 }()
 
 let fileURL: URL = {

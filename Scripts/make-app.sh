@@ -83,7 +83,25 @@ fi
 echo "▸ Verifying signature…"
 codesign --verify --strict --verbose=2 "$APP_DIR"
 
+# Install a copy to /Applications so the latest build is readily launchable for testing.
+# Skip with INSTALL=0. Quits any running instance first so the bundle can be replaced
+# cleanly (a running app holds its bundle open).
+INSTALL="${INSTALL:-1}"
+INSTALL_DIR="/Applications/$APP_NAME.app"
+if [ "$INSTALL" = "1" ]; then
+    echo "▸ Installing to $INSTALL_DIR (local testing copy)…"
+    osascript -e "quit app \"$APP_NAME\"" >/dev/null 2>&1 || true
+    pkill -x "$EXECUTABLE" >/dev/null 2>&1 || true
+    rm -rf "$INSTALL_DIR"
+    cp -R "$APP_DIR" "$INSTALL_DIR"
+fi
+
 echo "✓ Built: $APP_DIR"
+[ "$INSTALL" = "1" ] && echo "✓ Installed: $INSTALL_DIR"
 echo
-echo "  Launch it:   open \"$APP_DIR\""
+if [ "$INSTALL" = "1" ]; then
+    echo "  Launch it:   open \"$INSTALL_DIR\""
+else
+    echo "  Launch it:   open \"$APP_DIR\""
+fi
 echo "  Then grant:  System Settings ▸ Privacy & Security ▸ Microphone → enable \"$APP_NAME\""
