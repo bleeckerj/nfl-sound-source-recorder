@@ -22,7 +22,7 @@ struct RecordingVisualizerView: View {
             case .bars:
                 LEDSpectrumView(levels: controller.bandLevels, peaks: controller.bandPeaks)
             case .scope:
-                ScopeWaveformView(left: controller.scopeLeft, right: controller.scopeRight)
+                LissajousScopeView(left: controller.scopeLeft, right: controller.scopeRight)
             }
         }
         .padding(10)
@@ -180,12 +180,11 @@ struct DeckButton: View {
 
 // MARK: - Oscilloscope
 
-/// Time-domain oscilloscope: traces the actual waveform (the mono sum of the stereo
-/// pair) left-to-right, phosphor-green like a bench scope. Unlike a goniometer this
-/// stays lively for mono/voice content — the common case here — which on a phase
-/// display would collapse to a flat horizontal line. Peak-normalized every frame so
-/// any audible signal fills the height regardless of absolute level.
-struct ScopeWaveformView: View {
+/// Stereo X/Y oscilloscope: the left channel drives X and the right channel drives Y,
+/// producing the geometric figure made by two simultaneous signals. A mono signal
+/// naturally collapses toward the diagonal, while phase and stereo relationships draw
+/// the characteristic ellipses, loops, and more complex Lissajous figures.
+struct LissajousScopeView: View {
     let left: [Float]
     let right: [Float]
 
@@ -195,39 +194,46 @@ struct ScopeWaveformView: View {
     var body: some View {
         Canvas { ctx, size in
             let w = size.width, h = size.height
-            let cy = h / 2
-            let amp = h / 2 - 3   // vertical headroom for the trace
+            let center = CGPoint(x: w / 2, y: h / 2)
+            let radius = min(w, h) * 0.43
 
-            // Graticule: a horizontal baseline plus a few vertical divisions.
+            // Oscilloscope graticule: center axes, quarter divisions, and a circular
+            // plotting boundary make the X/Y relationship legible without labels.
             var grid = Path()
-            grid.move(to: CGPoint(x: 0, y: cy)); grid.addLine(to: CGPoint(x: w, y: cy))
-            for d in 1..<4 {
-                let x = w * CGFloat(d) / 4
-                grid.move(to: CGPoint(x: x, y: 0)); grid.addLine(to: CGPoint(x: x, y: h))
+            grid.addEllipse(in: CGRect(x: center.x - radius, y: center.y - radius,
+                                       width: radius * 2, height: radius * 2))
+            grid.addEllipse(in: CGRect(x: center.x - radius * 0.5, y: center.y - radius * 0.5,
+                                       width: radius, height: radius))
+            grid.move(to: CGPoint(x: center.x - radius, y: center.y))
+            grid.addLine(to: CGPoint(x: center.x + radius, y: center.y))
+            grid.move(to: CGPoint(x: center.x, y: center.y - radius))
+            grid.addLine(to: CGPoint(x: center.x, y: center.y + radius))
+            for fraction: CGFloat in [-0.5, 0.5] {
+                let x = center.x + radius * fraction
+                let y = center.y + radius * fraction
+                grid.move(to: CGPoint(x: x, y: center.y - 3))
+                grid.addLine(to: CGPoint(x: x, y: center.y + 3))
+                grid.move(to: CGPoint(x: center.x - 3, y: y))
+                grid.addLine(to: CGPoint(x: center.x + 3, y: y))
             }
             ctx.stroke(grid, with: .color(.white.opacity(0.10)), lineWidth: 1)
 
             let n = min(left.count, right.count)
+            guard n > 1 else { return }
 
-            // Mono sum drives the trace; peak-normalize so quiet passages still fill the
-            // height. Below the floor we hold a flat baseline (a resting scope) rather
-            // than amplifying noise to full screen.
+            // Auto-scale the current window while preserving the left/right amplitude
+            // relationship. X is left; Y is right, with screen Y inverted for Cartesian
+            // orientation. The path follows successive sample pairs through the figure.
             var peak: Float = 0
-            for i in 0..<n { peak = max(peak, abs((left[i] + right[i]) * 0.5)) }
-
-            func baseline() {
-                var line = Path()
-                line.move(to: CGPoint(x: 0, y: cy)); line.addLine(to: CGPoint(x: w, y: cy))
-                ctx.stroke(line, with: .color(green.opacity(0.55)), lineWidth: 1)
+            for i in 0..<n {
+                peak = max(peak, max(abs(left[i]), abs(right[i])))
             }
-            guard n > 1, peak > 0.0002 else { baseline(); return }
-
-            let norm = CGFloat(0.92) * amp / CGFloat(peak)
+            guard peak > 0.0002 else { return }
+            let scale = radius / CGFloat(peak)
             var path = Path()
             for i in 0..<n {
-                let s = CGFloat((left[i] + right[i]) * 0.5)
-                let x = w * CGFloat(i) / CGFloat(n - 1)
-                let y = cy - s * norm
+                let x = center.x + CGFloat(left[i]) * scale
+                let y = center.y - CGFloat(right[i]) * scale
                 if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
                 else { path.addLine(to: CGPoint(x: x, y: y)) }
             }
