@@ -63,11 +63,17 @@ func printUsage() {
 // MARK: - Listing
 
 func listEverything() {
-    print("Running apps with audio-capable processes:")
-    let apps = AudioProcesses.list()
-    for app in apps {
+    let catalog = AudioProcesses.catalog()
+    print("Applications (helpers folded in — --app taps the whole group):")
+    for app in catalog.apps {
         let state = app.isPlaying ? "playing" : "idle"
-        print("  pid \(String(app.pid).padding(toLength: 6, withPad: " ", startingAt: 0))  \(app.name)  [\(app.bundleID)]  \(state)")
+        let pids = app.tapPIDs.map(String.init).joined(separator: ",")
+        print("  \(app.name)  [\(app.bundleID)]  \(state)  pids: \(pids)")
+    }
+    print("\nSystem audio processes (no owning app — target with --pid):")
+    for daemon in catalog.daemons {
+        let state = daemon.isPlaying ? "playing" : "idle"
+        print("  pid \(String(daemon.pid).padding(toLength: 6, withPad: " ", startingAt: 0))  \(daemon.name)  [\(daemon.bundleID)]  \(state)")
     }
 
     print("\nOutput devices:")
@@ -99,10 +105,10 @@ func resolveTarget() -> ProcessTapRecorder.Target? {
     if hasFlag("--system") { return .systemWide }
     if let pidStr = argValue("--pid"), let pid = pid_t(pidStr) { return .pid(pid) }
     if let bundle = argValue("--app") {
-        if let app = AudioProcesses.bestMatch(bundleID: bundle) {
-            return .pid(app.pid)
+        if let app = AudioProcesses.app(matching: bundle) {
+            return .pids(app.tapPIDs)
         }
-        FileHandle.standardError.write("No audio-capable process with bundle id \(bundle). Start playback and run --list again.\n".data(using: .utf8)!)
+        FileHandle.standardError.write("No running application with bundle id \(bundle). Check --list.\n".data(using: .utf8)!)
         return nil
     }
     return nil
@@ -274,8 +280,9 @@ let tapTarget = resolveTarget()
 
 func targetLabel(_ t: ProcessTapRecorder.Target) -> String {
     switch t {
-    case .pid(let pid): return "pid \(pid)"
-    case .systemWide:   return "system audio"
+    case .pid(let pid):   return "pid \(pid)"
+    case .pids(let pids): return "pids \(pids.map(String.init).joined(separator: ","))"
+    case .systemWide:     return "system audio"
     }
 }
 

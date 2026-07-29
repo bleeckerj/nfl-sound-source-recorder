@@ -30,6 +30,9 @@ public final class ProcessTapRecorder: @unchecked Sendable {
 
     public enum Target {
         case pid(pid_t)
+        /// One app's whole process group (app + audio helpers), mixed down into
+        /// a single tap — see `AudioAppInfo.tapPIDs`.
+        case pids([pid_t])
         case systemWide
     }
 
@@ -278,15 +281,25 @@ public final class ProcessTapRecorder: @unchecked Sendable {
 
     // MARK: Setup steps
 
+    /// A stereo mixdown tap over every resolvable process object among `pids`.
+    /// Some of an app's helper pids may have quit since enumeration — that's fine
+    /// as long as at least one still has a HAL process object.
+    private static func mixdownDescription(of pids: [pid_t]) throws -> CATapDescription {
+        let objects = pids.compactMap { try? AudioSystem.processObject(for: $0) }.filter { $0 != 0 }
+        guard !objects.isEmpty else {
+            let list = pids.map(String.init).joined(separator: ", ")
+            throw CA.Error(status: -1, context: "No audio process object for pid(s) \(list) (is it playing audio?)")
+        }
+        return CATapDescription(stereoMixdownOfProcesses: objects)
+    }
+
     private func createTap(target: Target) throws {
         let description: CATapDescription
         switch target {
         case .pid(let pid):
-            let processObject = try AudioSystem.processObject(for: pid)
-            guard processObject != 0 else {
-                throw CA.Error(status: -1, context: "No audio process object for pid \(pid) (is it playing audio?)")
-            }
-            description = CATapDescription(stereoMixdownOfProcesses: [processObject])
+            description = try Self.mixdownDescription(of: [pid])
+        case .pids(let pids):
+            description = try Self.mixdownDescription(of: pids)
         case .systemWide:
             // Exclude our OWN process from the global tap. Otherwise the audio we
             // route back out to the output device is itself "system audio", gets

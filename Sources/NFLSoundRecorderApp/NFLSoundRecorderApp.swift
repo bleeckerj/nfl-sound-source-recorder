@@ -94,12 +94,14 @@ struct MenuContentView: View {
     var maxContentHeight: CGFloat? = nil
     @Environment(\.openWindow) private var openWindow
     @State private var measuredHeight: CGFloat = 0
+    /// Flip state: false = front (the tape deck), true = back (settings).
+    @State private var showingSettings = false
 
     var body: some View {
         if let maxContentHeight {
             // Hug the content when it fits; cap and scroll when it's taller than the screen.
             ScrollView {
-                panel.background(GeometryReader { geo in
+                flipCard.background(GeometryReader { geo in
                     Color.clear.preference(key: PanelHeightKey.self, value: geo.size.height)
                 })
             }
@@ -107,8 +109,71 @@ struct MenuContentView: View {
                    height: min(measuredHeight == 0 ? maxContentHeight : measuredHeight, maxContentHeight))
             .onPreferenceChange(PanelHeightKey.self) { measuredHeight = $0 }
         } else {
-            panel
+            flipCard
         }
+    }
+
+    /// The panel flips like a cassette: the deck on the front, settings on the back.
+    private var flipCard: some View {
+        ZStack {
+            panel
+                .opacity(showingSettings ? 0 : 1)
+                .rotation3DEffect(.degrees(showingSettings ? 180 : 0), axis: (x: 0, y: 1, z: 0))
+                .accessibilityHidden(showingSettings)
+            settingsPanel
+                .opacity(showingSettings ? 1 : 0)
+                .rotation3DEffect(.degrees(showingSettings ? 0 : -180), axis: (x: 0, y: 1, z: 0))
+                .accessibilityHidden(!showingSettings)
+        }
+        .animation(.easeInOut(duration: 0.45), value: showingSettings)
+    }
+
+    /// The "back side" — preferences. Currently the recordings save location; room to grow.
+    private var settingsPanel: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Button {
+                    withAnimation { showingSettings = false }
+                } label: {
+                    Image(systemName: "chevron.left")
+                }
+                .buttonStyle(.borderless)
+                .help("Back to the deck")
+                Text("Settings").font(.headline)
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Save recordings to").font(.caption).foregroundStyle(.secondary)
+                // The chosen folder, truncating the middle so both the folder name and a
+                // hint of its parent stay visible.
+                Text((controller.recordingsDirectory.path as NSString).abbreviatingWithTildeInPath)
+                    .font(.callout.monospaced())
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(8)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary))
+
+                HStack {
+                    Button("Choose…") { controller.chooseRecordingsDirectory() }
+                    Button("Reveal") { controller.revealRecordingsDirectory() }
+                    Spacer()
+                    Button("Default") { controller.resetRecordingsDirectory() }
+                        .disabled(controller.recordingsDirectory == RecordingController.defaultRecordingsDirectory)
+                }
+                .controlSize(.small)
+
+                Text("New recordings are written here. Existing files aren't moved.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(14)
+        .frame(width: 320)
     }
 
     private var panel: some View {
@@ -117,6 +182,13 @@ struct MenuContentView: View {
                 Image(systemName: "waveform.circle.fill").foregroundStyle(.tint)
                 Text("TapDeck").font(.headline)
                 Spacer()
+                Button {
+                    withAnimation { showingSettings = true }
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .buttonStyle(.borderless)
+                .help("Settings — recordings folder")
                 Button {
                     openWindow(id: "panel")
                     NSApp.activate(ignoringOtherApps: true)

@@ -68,6 +68,18 @@ final class RecordingController: ObservableObject {
         didSet { Prefs.set(eqGains, Prefs.eqGains) }
     }
 
+    /// Folder new recordings are written to. User-settable (see `chooseRecordingsDirectory`)
+    /// and persisted across launches; defaults to ~/Music/TapDeck.
+    @Published var recordingsDirectory: URL = RecordingController.defaultRecordingsDirectory {
+        didSet { Prefs.set(recordingsDirectory.path, Prefs.recordingsDir) }
+    }
+
+    /// The built-in default recordings location.
+    static var defaultRecordingsDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Music/TapDeck", isDirectory: true)
+    }
+
     @Published var isRecording = false
     @Published var isPaused = false
     @Published var elapsedText = "00:00"
@@ -128,6 +140,9 @@ final class RecordingController: ObservableObject {
         if d.object(forKey: Prefs.recordLevel) != nil { recordLevelDB = d.double(forKey: Prefs.recordLevel) }
         if d.object(forKey: Prefs.sourceLevel) != nil { sourceLevelDB = d.double(forKey: Prefs.sourceLevel) }
         if d.object(forKey: Prefs.micLevel) != nil { micLevelDB = d.double(forKey: Prefs.micLevel) }
+        if let p = d.string(forKey: Prefs.recordingsDir), !p.isEmpty {
+            recordingsDirectory = URL(fileURLWithPath: p, isDirectory: true)
+        }
     }
 
     /// Rebuild the source + device lists (call whenever the menu opens). The blocking HAL
@@ -140,11 +155,11 @@ final class RecordingController: ObservableObject {
             let outputs = try? AudioSystem.outputDevices()
             let defaultOut = try? AudioSystem.defaultOutputDevice()
             let inputs = (try? AudioSystem.inputDevices()) ?? []
-            let apps = AudioProcesses.list()
+            let catalog = AudioProcesses.catalog()
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.applyEnumeration(outputs: outputs, defaultOut: defaultOut,
-                                      inputs: inputs, apps: apps)
+                                      inputs: inputs, catalog: catalog)
                 self.isRefreshing = false
             }
         }
@@ -153,7 +168,7 @@ final class RecordingController: ObservableObject {
     /// Publish freshly-enumerated devices/sources and reconcile the current selections.
     /// Runs on the main actor; icon lookup (`NSRunningApplication`) is main-affine.
     private func applyEnumeration(outputs: [AudioDeviceInfo]?, defaultOut: AudioObjectID?,
-                                  inputs: [AudioDeviceInfo], apps: [AudioProcessInfo]) {
+                                  inputs: [AudioDeviceInfo], catalog: AudioSourceCatalog) {
         if let outputs {
             devices = outputs
             // Keep an explicit "record only" choice; otherwise fall back to a real device.
@@ -188,36 +203,33 @@ final class RecordingController: ObservableObject {
                 makeTarget: { nil }
             )
         ]
-        for app in apps {
+        // One row per Dock application; its audio helpers (browser renderers etc.)
+        // are folded in and tapped as a group at record time — re-resolved then,
+        // because helpers can spawn between menu-open and Record.
+        for app in catalog.apps {
             let pid = app.pid
-            let icon = NSRunningApplication(processIdentifier: pid)?.icon
-            let label = Self.sourceLabel(for: app)
+            let bundleID = app.bundleID
             options.append(SourceOption(
-                id: "\(app.bundleID):\(pid)",
-                label: label,
-                icon: icon,
-                makeTarget: {
-                    let targetPID = AudioProcesses.bestMatch(bundleID: app.bundleID)?.pid ?? pid
-                    return .pid(targetPID)
-                }
+                id: bundleID,
+                label: app.isPlaying ? "\(app.name) — playing" : app.name,
+                icon: NSRunningApplication(processIdentifier: pid)?.icon,
+                makeTarget: { .pids(AudioProcesses.app(matching: bundleID)?.tapPIDs ?? [pid]) }
+            ))
+        }
+        // A daemon earns a row only while it is audibly producing output; idle
+        // HAL registrants (mediaremoted, corespeechd, …) stay hidden. So do we:
+        // while routing, our own output "plays", but we must never tap ourselves.
+        for daemon in catalog.daemons where daemon.isPlaying && daemon.pid != getpid() {
+            let pid = daemon.pid
+            options.append(SourceOption(
+                id: "daemon:\(daemon.bundleID):\(pid)",
+                label: "\(daemon.name) — playing",
+                icon: NSImage(systemSymbolName: "gearshape.2", accessibilityDescription: nil),
+                makeTarget: { .pid(pid) }
             ))
         }
         sources = options
         if !sources.contains(where: { $0.id == selectedSourceID }) { selectedSourceID = "system" }
-    }
-
-    private static func sourceLabel(for app: AudioProcessInfo) -> String {
-        let name = app.name == app.bundleID ? friendlyBundleName(app.bundleID) : app.name
-        let state = app.isPlaying ? "playing" : "idle - no signal now"
-        return "\(name) - \(state) (pid \(app.pid))"
-    }
-
-    private static func friendlyBundleName(_ bundleID: String) -> String {
-        let parts = bundleID.split(separator: ".").map(String.init)
-        if parts.count >= 2, parts.last?.lowercased() == "helper" {
-            return "\(parts[parts.count - 2]) Helper"
-        }
-        return parts.last ?? bundleID
     }
 
     /// The microphone device currently selected, or nil for "off".
@@ -326,7 +338,7 @@ final class RecordingController: ObservableObject {
             device = picked
         }
 
-        let url = Self.newFileURL(format: recordingFormat)
+        let url = newFileURL(format: recordingFormat)
         let rec = ProcessTapRecorder(source: captureSource, outputDevice: device, fileURL: url,
                                      format: recordingFormat, mute: mute,
                                      driftCompensation: false)
@@ -548,13 +560,49 @@ final class RecordingController: ObservableObject {
         elapsedText = String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 
-    private static func newFileURL(format: RecordingFormat) -> URL {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Music/TapDeck", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    private func newFileURL(format: RecordingFormat) -> URL {
+        // Use the chosen directory, creating it if needed; fall back to the built-in default
+        // if that folder can't be created (e.g. it was deleted or is no longer writable).
+        var dir = recordingsDirectory
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            let fallback = Self.defaultRecordingsDirectory
+            try? FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
+            lastError = "Couldn't use \(dir.path) — saving to \(fallback.path) instead."
+            dir = fallback
+        }
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
         return dir.appendingPathComponent("Recording \(formatter.string(from: Date())).\(format.fileExtension)")
+    }
+
+    /// Present a folder picker for the recordings location. Runs modally on the main thread;
+    /// the choice is persisted via `recordingsDirectory`'s observer.
+    func chooseRecordingsDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = recordingsDirectory
+        panel.prompt = "Choose"
+        panel.message = "Choose where TapDeck saves recordings"
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            recordingsDirectory = url
+        }
+    }
+
+    /// Reset the recordings location to the built-in default (~/Music/TapDeck).
+    func resetRecordingsDirectory() {
+        recordingsDirectory = Self.defaultRecordingsDirectory
+    }
+
+    /// Open the recordings folder in Finder.
+    func revealRecordingsDirectory() {
+        try? FileManager.default.createDirectory(at: recordingsDirectory, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([recordingsDirectory])
     }
 }
 
@@ -569,5 +617,6 @@ private enum Prefs {
     static let recordLevel = "recordLevelDB"
     static let sourceLevel = "sourceLevelDB"
     static let micLevel = "micLevelDB"
+    static let recordingsDir = "recordingsDirectory"
     static func set(_ value: Any, _ key: String) { UserDefaults.standard.set(value, forKey: key) }
 }

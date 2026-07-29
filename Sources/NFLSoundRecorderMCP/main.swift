@@ -84,10 +84,17 @@ final class MCPServer {
     private func callTool(name: String, arguments: [String: Any]) -> (text: String, isError: Bool) {
         switch name {
         case "list_applications":
-            let apps = AudioProcesses.list().map {
-                ["name": $0.name, "bundleId": $0.bundleID, "pid": Int($0.pid), "isPlaying": $0.isPlaying] as [String: Any]
+            // Grouped view: one entry per Dock app, helpers folded into tapPids.
+            // Daemons (HAL processes no app owns) are listed only while playing.
+            let catalog = AudioProcesses.catalog()
+            let apps = catalog.apps.map {
+                ["name": $0.name, "bundleId": $0.bundleID, "pid": Int($0.pid),
+                 "isPlaying": $0.isPlaying, "tapPids": $0.tapPIDs.map(Int.init)] as [String: Any]
             }
-            return (Self.json(["applications": apps]), false)
+            let daemons = catalog.daemons.filter(\.isPlaying).map {
+                ["name": $0.name, "bundleId": $0.bundleID, "pid": Int($0.pid), "isPlaying": true] as [String: Any]
+            }
+            return (Self.json(["applications": apps, "playingSystemProcesses": daemons]), false)
 
         case "list_output_devices":
             do {
@@ -164,11 +171,11 @@ final class MCPServer {
             if source == "system" {
                 tapTarget = .systemWide
                 tapLabel = "All System Audio"
-            } else if let app = AudioProcesses.bestMatch(bundleID: args["source"] as? String ?? source) {
-                tapTarget = .pid(app.pid)
+            } else if let app = AudioProcesses.app(matching: args["source"] as? String ?? source) {
+                tapTarget = .pids(app.tapPIDs)
                 tapLabel = app.name
             } else {
-                return ("No audio-capable process with bundle id '\(source)'. Start playback, call list_applications again, or use source 'microphone' to record the mic.", true)
+                return ("No running application with bundle id '\(source)'. Call list_applications, or use source 'microphone' to record the mic.", true)
             }
         }
 
