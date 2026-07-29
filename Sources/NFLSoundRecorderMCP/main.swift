@@ -131,6 +131,52 @@ final class MCPServer {
                 "centerFrequencies": GraphicEQ.centerFrequencies,
             ]), false)
 
+        case "pause_recording":
+            do {
+                try session.setPaused(true)
+                return (Self.json(["paused": true, "elapsedSeconds": session.elapsed ?? 0]), false)
+            } catch {
+                return (Self.errorText(error), true)
+            }
+
+        case "resume_recording":
+            do {
+                try session.setPaused(false)
+                return (Self.json(["paused": false, "elapsedSeconds": session.elapsed ?? 0]), false)
+            } catch {
+                return (Self.errorText(error), true)
+            }
+
+        case "set_routing_device":
+            do {
+                let device = try outputDevice(for: arguments["output_uid"] as? String)
+                try session.setRoutingDevice(device)
+                var result: [String: Any] = [
+                    "routing": device != nil,
+                    "device": device?.name ?? "(record only)",
+                ]
+                if let uid = device?.uid { result["uid"] = uid }
+                return (Self.json(result), false)
+            } catch {
+                return (Self.errorText(error), true)
+            }
+
+        case "set_recording_levels":
+            do {
+                let sourceDB = (arguments["source_level_db"] as? NSNumber)?.doubleValue
+                let micDB = (arguments["mic_level_db"] as? NSNumber)?.doubleValue
+                guard sourceDB != nil || micDB != nil else {
+                    throw RecorderSession.SessionError("Provide source_level_db and/or mic_level_db.")
+                }
+                try session.setLevels(sourceDB: sourceDB, micDB: micDB)
+                var result: [String: Any] = [:]
+                if let sourceDB { result["sourceLevelDB"] = sourceDB }
+                if let micDB { result["micLevelDB"] = micDB }
+                return (Self.json(result), false)
+            } catch {
+                return (Self.errorText(error), true)
+            }
+
         case "stop_recording":
             if let stopped = session.stop() {
                 return (Self.json(["stopped": true, "file": stopped.url.path, "durationSeconds": Int(stopped.duration)]), false)
@@ -139,16 +185,17 @@ final class MCPServer {
 
         case "recording_status":
             if let active = session.active {
-                let elapsed = Int(Date().timeIntervalSince(active.startDate))
                 return (Self.json([
                     "isRecording": true, "source": active.sourceLabel, "device": active.deviceName,
-                    "file": active.fileURL.path, "elapsedSeconds": elapsed,
+                    "file": active.fileURL.path, "elapsedSeconds": Int(session.elapsed ?? 0),
+                    "paused": session.isPaused,
                     "framesCaptured": Int(active.recorder.meter.totalFrames),
                     "inputPeak": Double(active.recorder.meter.peak),
                     "equalizerEnabled": session.eqEnabled, "gains": session.eqGains,
                 ]), false)
             }
-            return (Self.json(["isRecording": false, "equalizerEnabled": session.eqEnabled, "gains": session.eqGains]), false)
+            return (Self.json(["isRecording": false, "paused": false,
+                               "equalizerEnabled": session.eqEnabled, "gains": session.eqGains]), false)
 
         default:
             return ("Unknown tool: \(name)", true)
@@ -211,23 +258,10 @@ final class MCPServer {
 
         // Resolve the output device. `output_uid: "none"` records only (no routing).
         let device: AudioDeviceInfo?
-        if (args["output_uid"] as? String)?.lowercased() == "none" {
-            device = nil
-        } else {
-            let devices: [AudioDeviceInfo]
-            do { devices = try AudioSystem.outputDevices() } catch { return ("Error listing devices: \(error)", true) }
-            if let uid = args["output_uid"] as? String {
-                guard let match = devices.first(where: { $0.uid == uid }) else {
-                    return ("No output device with uid '\(uid)'. Call list_output_devices first.", true)
-                }
-                device = match
-            } else {
-                let defaultID = try? AudioSystem.defaultOutputDevice()
-                guard let match = devices.first(where: { $0.id == defaultID }) ?? devices.first else {
-                    return ("No output devices available. Pass output_uid 'none' to record only.", true)
-                }
-                device = match
-            }
+        do {
+            device = try outputDevice(for: args["output_uid"] as? String)
+        } catch {
+            return (Self.errorText(error), true)
         }
 
         let mute = (args["mute"] as? Bool) ?? false
@@ -265,6 +299,24 @@ final class MCPServer {
         } catch {
             return ("Failed to start recording: \(error)", true)
         }
+    }
+
+    private func outputDevice(for uid: String?) throws -> AudioDeviceInfo? {
+        if uid?.lowercased() == "none" { return nil }
+
+        let devices = try AudioSystem.outputDevices()
+        if let uid {
+            guard let match = devices.first(where: { $0.uid == uid }) else {
+                throw RecorderSession.SessionError("No output device with uid '\(uid)'. Call list_output_devices first.")
+            }
+            return match
+        }
+
+        let defaultID = try? AudioSystem.defaultOutputDevice()
+        guard let match = devices.first(where: { $0.id == defaultID }) ?? devices.first else {
+            throw RecorderSession.SessionError("No output devices available. Pass output_uid 'none' to record only.")
+        }
+        return match
     }
 
     // MARK: Tool schemas
@@ -321,13 +373,47 @@ final class MCPServer {
             ],
         ],
         [
+            "name": "pause_recording",
+            "description": "Pause writing audio to the current file while keeping capture and live monitoring active. Elapsed recording time excludes the pause.",
+            "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
+        ],
+        [
+            "name": "resume_recording",
+            "description": "Resume writing audio to the current file after pause.",
+            "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
+        ],
+        [
+            "name": "set_routing_device",
+            "description": "Change the live monitor/output destination without interrupting the recording. Use output_uid 'none' to stop routing while continuing to record.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "output_uid": stringProp("Output device UID from list_output_devices, or 'none' for record-only mode."),
+                ],
+                "required": ["output_uid"],
+                "additionalProperties": false,
+            ],
+        ],
+        [
+            "name": "set_recording_levels",
+            "description": "Change source and/or microphone gain live during a recording. Values are dB, with 0 as unity gain.",
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "source_level_db": ["type": "number", "description": "Tap/system feed level in dB."],
+                    "mic_level_db": ["type": "number", "description": "Microphone feed level in dB."],
+                ],
+                "additionalProperties": false,
+            ],
+        ],
+        [
             "name": "stop_recording",
             "description": "Stop the current recording and return the saved file path and duration.",
             "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
         [
             "name": "recording_status",
-            "description": "Report whether a recording is in progress, and if so its source, device, file, and elapsed seconds.",
+            "description": "Report whether a recording is in progress, including paused state, source, live output device, file, elapsed recording seconds, meter peak, and EQ state.",
             "inputSchema": ["type": "object", "properties": [String: Any](), "additionalProperties": false],
         ],
     ] }
@@ -337,6 +423,13 @@ final class MCPServer {
               let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
               let string = String(data: data, encoding: .utf8) else { return "{}" }
         return string
+    }
+
+    static func errorText(_ error: Error) -> String {
+        if let localized = error as? LocalizedError, let description = localized.errorDescription {
+            return description
+        }
+        return String(describing: error)
     }
 }
 

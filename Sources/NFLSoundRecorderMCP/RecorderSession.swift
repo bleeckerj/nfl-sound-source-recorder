@@ -7,12 +7,16 @@ final class RecorderSession {
         let recorder: ProcessTapRecorder
         let fileURL: URL
         let sourceLabel: String
-        let deviceName: String
+        var deviceName: String
         let startDate: Date
     }
 
     private(set) var active: Active?
     var isRecording: Bool { active != nil }
+    private(set) var isPaused = false
+
+    private var pausedAt: Date?
+    private var pausedTotal: TimeInterval = 0
 
     // Desired EQ state; applied to each recording and updated live if recording.
     private(set) var eqEnabled = false
@@ -39,6 +43,9 @@ final class RecorderSession {
         if let micLevelDB { recorder.setMicGain(dB: micLevelDB) }
         active = Active(recorder: recorder, fileURL: fileURL, sourceLabel: sourceLabel,
                         deviceName: device?.name ?? "(record only)", startDate: Date())
+        isPaused = false
+        pausedAt = nil
+        pausedTotal = 0
     }
 
     /// Update EQ state; takes effect immediately if a recording is in progress.
@@ -53,20 +60,59 @@ final class RecorderSession {
         }
     }
 
+    /// Pause or resume file writing while keeping the capture and monitor alive.
+    func setPaused(_ paused: Bool) throws {
+        guard let active else { throw SessionError("Not currently recording.") }
+        guard isPaused != paused else { return }
+
+        if paused {
+            pausedAt = Date()
+        } else if let pausedAt {
+            pausedTotal += Date().timeIntervalSince(pausedAt)
+            self.pausedAt = nil
+        }
+        isPaused = paused
+        active.recorder.setPaused(paused)
+    }
+
+    /// Reroute the live monitor without interrupting capture. Passing nil disables routing.
+    func setRoutingDevice(_ device: AudioDeviceInfo?) throws {
+        guard let active else { throw SessionError("Not currently recording.") }
+        active.recorder.setRoutingDevice(device)
+        self.active?.deviceName = device?.name ?? "(record only)"
+    }
+
+    /// Apply live source/microphone gain changes to the active recorder.
+    func setLevels(sourceDB: Double?, micDB: Double?) throws {
+        guard let active else { throw SessionError("Not currently recording.") }
+        if let sourceDB { active.recorder.setSourceGain(dB: sourceDB) }
+        if let micDB { active.recorder.setMicGain(dB: micDB) }
+    }
+
+    var elapsed: TimeInterval? {
+        guard let active else { return nil }
+        let paused = pausedAt.map { Date().timeIntervalSince($0) } ?? 0
+        return max(0, Date().timeIntervalSince(active.startDate) - pausedTotal - paused)
+    }
+
     /// Stops the recording and returns the file URL and its duration in seconds.
     @discardableResult
     func stop() -> (url: URL, duration: TimeInterval)? {
         guard let active else { return nil }
         active.recorder.stop()
-        let duration = Date().timeIntervalSince(active.startDate)
+        let duration = elapsed ?? Date().timeIntervalSince(active.startDate)
         self.active = nil
+        isPaused = false
+        pausedAt = nil
+        pausedTotal = 0
         return (active.fileURL, duration)
     }
 
-    struct SessionError: Error, CustomStringConvertible {
+    struct SessionError: LocalizedError, CustomStringConvertible {
         let message: String
         init(_ message: String) { self.message = message }
         var description: String { message }
+        var errorDescription: String? { message }
     }
 }
 
