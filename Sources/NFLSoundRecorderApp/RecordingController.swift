@@ -382,7 +382,13 @@ final class RecordingController: ObservableObject {
     private func startTickTimer() {
         timer?.invalidate()
         let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
+            // This timer is installed on RunLoop.main, so execute the tick in the
+            // callback. Enqueuing a MainActor Task here lets delayed UI work pile up
+            // at 30 tasks per second; the backlog makes the meters lag and keeps CPU
+            // busy long after the frame that created each task is useful.
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
