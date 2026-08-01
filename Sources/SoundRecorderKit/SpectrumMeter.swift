@@ -63,10 +63,12 @@ public final class SpectrumMeter: @unchecked Sendable {
 
     // MARK: Audio thread
 
-    public func ingest(_ abl: UnsafeMutableAudioBufferListPointer, frames: Int) {
+    public func ingest(_ abl: UnsafeMutableAudioBufferListPointer, frames: Int,
+                       gain: Float = 1) {
         guard frames > 0, let buffer = abl.first, let data = buffer.mData else { return }
         let channels = max(1, Int(buffer.mNumberChannels))
         let src = data.assumingMemoryBound(to: Float.self)
+        let meterGain = gain.isFinite ? max(0, gain) : 1
 
         // Slide the newest samples into a rolling mono window.
         let take = min(frames, n)
@@ -75,7 +77,8 @@ public final class SpectrumMeter: @unchecked Sendable {
         let startFrame = frames - take
         for i in 0..<take {
             let idx = (startFrame + i) * channels
-            mono[keep + i] = channels >= 2 ? (src[idx] + src[idx + 1]) * 0.5 : src[idx]
+            let sample = channels >= 2 ? (src[idx] + src[idx + 1]) * 0.5 : src[idx]
+            mono[keep + i] = sample * meterGain
         }
         analyze()
     }

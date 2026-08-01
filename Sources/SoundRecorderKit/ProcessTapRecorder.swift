@@ -439,10 +439,10 @@ public final class ProcessTapRecorder: @unchecked Sendable {
             // route at natural level, then record (with record gain applied).
             if !eq.isEnabled || frames == 0 || scratch == nil || frames > scratch!.frameCapacity {
                 ring?.write(abl, frames: frames)          // monitor at natural level, pre record-gain
+                spectrum.ingest(abl, frames: frames, gain: gain)
+                scope.ingest(abl, frames: frames)
                 if gain != 1 { scaleBuffers(abl, by: gain) }
                 if recordToFile { writer?.enqueue(abl, frames: frames) }   // off-thread write
-                spectrum.ingest(abl, frames: frames)
-                scope.ingest(abl, frames: frames)
                 return
             }
 
@@ -453,11 +453,11 @@ public final class ProcessTapRecorder: @unchecked Sendable {
             copyBuffers(from: abl, to: workABL)
             eq.process(workABL)
             ring?.write(workABL, frames: frames)          // monitor at EQ'd natural level, pre record-gain
+            // Meter the post-EQ, post-gain signal so LEDs reflect EQ and record level.
+            spectrum.ingest(workABL, frames: frames, gain: gain)
+            scope.ingest(workABL, frames: frames)
             if gain != 1 { scaleBuffers(workABL, by: gain) }
             if recordToFile { writer?.enqueue(workABL, frames: frames) }   // off-thread write
-            // Meter the post-EQ, post-gain signal so LEDs reflect EQ and record level.
-            spectrum.ingest(workABL, frames: frames)
-            scope.ingest(workABL, frames: frames)
         }
     }
 
