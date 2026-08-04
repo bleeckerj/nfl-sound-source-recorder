@@ -87,20 +87,15 @@ final class RecordingController: ObservableObject {
 
     @Published var isRecording = false
     @Published var isPaused = false
-    @Published var elapsedText = "00:00"
     @Published var statusText = "Idle"
-    @Published var bandLevels: [Float] = Array(repeating: 0, count: SpectrumMeter.bandCount)
-    @Published var bandPeaks: [Float] = Array(repeating: 0, count: SpectrumMeter.bandCount)
     @Published var vizMode: VizMode = .bars
-    @Published var scopeLeft: [Float] = []
-    @Published var scopeRight: [Float] = []
-    /// Rotation (degrees) for the menu-bar cassette reels; advances while recording.
-    @Published var iconAngle: Double = 0
-    /// Smoothed live audio level (0...1) driving the menu-bar icon — the reels spin
-    /// faster and the hub pulses as the captured signal gets louder.
-    @Published var iconLevel: Double = 0
     @Published var lastError: String?
     @Published var lastFileURL: URL?
+
+    /// Everything the 30 Hz tick rewrites — meters, reels, elapsed clock. A separate
+    /// object (not `@Published` here, so mutating it never invalidates the panel) observed
+    /// only by the views that draw it. See `MeterState`.
+    let meters = MeterState()
 
     private var recorder: ProcessTapRecorder?
     private var timer: Timer?
@@ -360,7 +355,7 @@ final class RecordingController: ObservableObject {
         lastFileURL = url
         startDate = nil          // set on confirmation so the elapsed clock starts at 0
         pausedAt = nil; pausedTotal = 0; isPaused = false
-        elapsedText = "00:00"
+        meters.elapsedText = "00:00"
         isRecording = true
         statusText = "Starting…"
 
@@ -426,11 +421,7 @@ final class RecordingController: ObservableObject {
         pausedTotal = 0
         isRecording = false
         isPaused = false
-        bandLevels = Array(repeating: 0, count: SpectrumMeter.bandCount)
-        bandPeaks = Array(repeating: 0, count: SpectrumMeter.bandCount)
-        scopeLeft = []
-        scopeRight = []
-        iconLevel = 0
+        meters.reset()
         let name = lastFileURL?.lastPathComponent ?? "recording"
         // Tear down off-main: rec.stop() blocks on Core Audio and flushes+closes the file.
         // The UI is already back to "stopped" so a wedged server can't beachball it.
@@ -543,18 +534,20 @@ final class RecordingController: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    /// Publishes a meter frame. Every write lands on `meters`, never on `self`, so a frame
+    /// invalidates only the cassette / meter / menu-bar-icon views rather than the whole panel.
     private func tick() {
         // Paused: hold the reels, meters, and clock where they are.
         guard !isPaused else { return }
         if let recorder {
             switch vizMode {
             case .bars:
-                bandLevels = recorder.spectrum.levels()
-                bandPeaks = recorder.spectrum.peakLevels()
+                meters.bandLevels = recorder.spectrum.levels()
+                meters.bandPeaks = recorder.spectrum.peakLevels()
             case .scope:
                 let s = recorder.scope.snapshot()
-                scopeLeft = s.left
-                scopeRight = s.right
+                meters.scopeLeft = s.left
+                meters.scopeRight = s.right
             }
         }
         // Smoothed live level (0...1) for the menu-bar icon's hub swell: map the
@@ -563,15 +556,15 @@ final class RecordingController: ObservableObject {
         let peak = recorder?.meter.takePeak() ?? 0
         let target = peak > 0 ? max(0, min(1, (LevelMeter.dBFS(peak) + 54) / 54)) : 0
         // Assymmetric smoothing: snap up on transients, decay slowly like a VU meter.
-        let ease = target > iconLevel ? 0.6 : 0.15
-        iconLevel += (target - iconLevel) * ease
+        let ease = target > meters.iconLevel ? 0.6 : 0.15
+        meters.iconLevel += (target - meters.iconLevel) * ease
         // Spin the reels at a *constant* rate — a real tape transport moves the tape at
         // a fixed speed regardless of the signal on it. Tying speed to level made the
         // reels surge and stall with the audio ("hurk-and-jerk"), so keep it steady.
-        iconAngle = (iconAngle + 6).truncatingRemainder(dividingBy: 360)
+        meters.iconAngle = (meters.iconAngle + 6).truncatingRemainder(dividingBy: 360)
         guard let startDate else { return }
         let seconds = Int(Date().timeIntervalSince(startDate) - pausedTotal)
-        elapsedText = String(format: "%02d:%02d", seconds / 60, seconds % 60)
+        meters.elapsedText = String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 
     private func newFileURL(format: RecordingFormat) -> URL {

@@ -3,30 +3,58 @@ import SoundRecorderKit
 
 /// The "recording in progress" panel: a skeuomorphic cassette above a 10-band LED
 /// spectrum meter driven by the live (post-EQ) audio stream.
+///
+/// This view observes only the *controller*, so it is re-evaluated when the transport
+/// state changes — not per meter frame. The two pieces that do animate at 30 Hz
+/// (`CassetteDisplay`, `MeterDisplay`) observe `MeterState` themselves, which confines
+/// each frame's invalidation to them instead of the enclosing panel.
 struct RecordingVisualizerView: View {
     @ObservedObject var controller: RecordingController
 
     var body: some View {
         VStack(spacing: 8) {
-            CassetteView(elapsed: controller.elapsedText,
-                         angle: controller.iconAngle,
-                         isRecording: controller.isRecording,
-                         isPaused: controller.isPaused)
+            CassetteDisplay(meters: controller.meters,
+                            isRecording: controller.isRecording,
+                            isPaused: controller.isPaused)
 
             // Physical transport keys — the primary record controls.
             DeckTransport(controller: controller)
 
             TransportSelector(mode: $controller.vizMode)
 
-            switch controller.vizMode {
-            case .bars:
-                LEDSpectrumView(levels: controller.bandLevels, peaks: controller.bandPeaks)
-            case .scope:
-                LissajousScopeView(left: controller.scopeLeft, right: controller.scopeRight)
-            }
+            MeterDisplay(meters: controller.meters, mode: controller.vizMode)
         }
         .padding(10)
         .background(RoundedRectangle(cornerRadius: 12).fill(Color.black.opacity(0.88)))
+    }
+}
+
+/// Wraps the cassette so the spinning reels and the running clock redraw on their own.
+private struct CassetteDisplay: View {
+    @ObservedObject var meters: MeterState
+    let isRecording: Bool
+    let isPaused: Bool
+
+    var body: some View {
+        CassetteView(elapsed: meters.elapsedText,
+                     angle: meters.iconAngle,
+                     isRecording: isRecording,
+                     isPaused: isPaused)
+    }
+}
+
+/// Wraps the active meter so its 30 Hz redraw doesn't reach the panel around it.
+private struct MeterDisplay: View {
+    @ObservedObject var meters: MeterState
+    let mode: VizMode
+
+    var body: some View {
+        switch mode {
+        case .bars:
+            LEDSpectrumView(levels: meters.bandLevels, peaks: meters.bandPeaks)
+        case .scope:
+            LissajousScopeView(left: meters.scopeLeft, right: meters.scopeRight)
+        }
     }
 }
 

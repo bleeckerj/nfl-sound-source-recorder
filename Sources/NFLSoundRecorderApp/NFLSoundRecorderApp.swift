@@ -13,11 +13,10 @@ struct NFLSoundRecorderApp: App {
             MenuContentView(controller: controller,
                             maxContentHeight: (NSScreen.main?.visibleFrame.height ?? 760) - 16)
         } label: {
-            // Rasterize the cassette to a template image — MenuBarExtra renders an
-            // Image reliably, but not an arbitrary SwiftUI shape view (comes up blank).
-            Image(nsImage: MenuBarIconRenderer.image(isRecording: controller.isRecording,
-                                                     angle: controller.iconAngle,
-                                                     level: controller.iconLevel))
+            // Its own view observing MeterState: reading the reel angle/level here in the
+            // Scene body would re-evaluate the whole scene — and rebuild MenuContentView —
+            // 30 times a second while recording.
+            MenuBarLabel(meters: controller.meters, isRecording: controller.isRecording)
         }
         .menuBarExtraStyle(.window)
 
@@ -31,6 +30,19 @@ struct NFLSoundRecorderApp: App {
                 .background(TransparentWindow())
         }
         .windowResizability(.contentSize)
+    }
+}
+
+/// The menu-bar cassette, rasterized to a template image — MenuBarExtra renders an
+/// Image reliably, but not an arbitrary SwiftUI shape view (comes up blank).
+struct MenuBarLabel: View {
+    @ObservedObject var meters: MeterState
+    let isRecording: Bool
+
+    var body: some View {
+        Image(nsImage: MenuBarIconRenderer.image(isRecording: isRecording,
+                                                 angle: meters.iconAngle,
+                                                 level: meters.iconLevel))
     }
 }
 
