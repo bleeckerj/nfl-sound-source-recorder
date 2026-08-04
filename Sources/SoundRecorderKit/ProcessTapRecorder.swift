@@ -92,9 +92,15 @@ public final class ProcessTapRecorder: @unchecked Sendable {
     private let sourceGainLock = OSAllocatedUnfairLock(initialState: Float(1))
     private let micGainLock = OSAllocatedUnfairLock(initialState: Float(1))
 
-    /// Set the record level in dB (0 dB = unity). Clamped to +36 dB.
+    /// At or below this the record level is off — true silence, not a very quiet signal.
+    /// A fader with no −∞ end can't actually mute, which makes "all the way down" a lie.
+    public static let recordLevelOffDB: Double = -60
+
+    /// Set the record level in dB (0 dB = unity). Clamped to +36 dB; at or below
+    /// `recordLevelOffDB` the gain is exactly zero.
     public func setRecordGain(dB: Double) {
-        gainLock.withLock { $0 = powf(10, Float(min(36, dB)) / 20) }
+        let g: Float = dB <= Self.recordLevelOffDB ? 0 : powf(10, Float(min(36, dB)) / 20)
+        gainLock.withLock { $0 = g }
     }
 
     /// Set the tap/system feed level in dB (0 dB = unity). Clamped to +36 dB.

@@ -277,9 +277,13 @@ struct MenuContentView: View {
                                 set: { controller.setMicLevel($0) })
             }
 
+            // Full travel from silence to +24 dB: hard-left is a real mute, so the
+            // fader position matches what actually lands in the file (and on the LEDs).
             LevelSliderView(label: "Record Level",
                             value: controller.recordLevelDB,
-                            set: { controller.setRecordLevel($0) })
+                            set: { controller.setRecordLevel($0) },
+                            range: ProcessTapRecorder.recordLevelOffDB...24,
+                            mutesAtMinimum: true)
 
             // The tape deck — cassette, transport keys, and meters — is always
             // present; it just idles (static reels, dim meters) when not recording.
@@ -331,16 +335,25 @@ struct LevelSliderView: View {
     let label: String
     let value: Double
     let set: (Double) -> Void
+    var range: ClosedRange<Double> = -12...24
+    /// When true the bottom of the travel is a true mute (−∞), not just the quietest
+    /// trim — so hard-left reads "Off" rather than a dB number that still passes signal.
+    var mutesAtMinimum = false
+
+    private var isOff: Bool { mutesAtMinimum && value <= range.lowerBound }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
                 Text(label).font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Text(String(format: "%+.0f dB", value))
-                    .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                // "Off" while recording means writing silence to disk — worth an amber
+                // read-out so it can't be mistaken for a merely quiet setting.
+                Text(isOff ? "Off" : String(format: "%+.0f dB", value))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(isOff ? AnyShapeStyle(Color.orange) : AnyShapeStyle(.secondary))
             }
-            Slider(value: Binding(get: { value }, set: { set($0) }), in: -12...24, step: 1)
+            Slider(value: Binding(get: { value }, set: { set($0) }), in: range, step: 1)
         }
     }
 }

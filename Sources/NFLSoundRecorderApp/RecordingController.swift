@@ -16,6 +16,11 @@ struct SourceOption: Identifiable, Hashable {
     let id: String
     let label: String
     let icon: NSImage?
+    /// Whether this source taps process audio. Stored rather than derived by *calling*
+    /// `makeTarget()`: that closure re-enumerates the HAL (a blocking IPC round-trip per
+    /// audio process), which is fine at record time but ruinous when the UI asks the
+    /// question during a view update. See `RecordingController.sourceHasTap`.
+    let isTap: Bool
     let makeTarget: @Sendable () -> ProcessTapRecorder.Target?
 
     static func == (lhs: SourceOption, rhs: SourceOption) -> Bool { lhs.id == rhs.id }
@@ -194,12 +199,14 @@ final class RecordingController: ObservableObject {
                 id: "system",
                 label: "All System Audio",
                 icon: NSImage(systemSymbolName: "speaker.wave.3.fill", accessibilityDescription: nil),
+                isTap: true,
                 makeTarget: { .systemWide }
             ),
             SourceOption(
                 id: Self.micOnlySourceID,
                 label: "None — microphone only",
                 icon: NSImage(systemSymbolName: "mic.slash.fill", accessibilityDescription: nil),
+                isTap: false,
                 makeTarget: { nil }
             )
         ]
@@ -213,6 +220,7 @@ final class RecordingController: ObservableObject {
                 id: bundleID,
                 label: app.isPlaying ? "\(app.name) — playing" : app.name,
                 icon: NSRunningApplication(processIdentifier: pid)?.icon,
+                isTap: true,
                 makeTarget: { .pids(AudioProcesses.app(matching: bundleID)?.tapPIDs ?? [pid]) }
             ))
         }
@@ -225,6 +233,7 @@ final class RecordingController: ObservableObject {
                 id: "daemon:\(daemon.bundleID):\(pid)",
                 label: "\(daemon.name) — playing",
                 icon: NSImage(systemSymbolName: "gearshape.2", accessibilityDescription: nil),
+                isTap: true,
                 makeTarget: { .pid(pid) }
             ))
         }
@@ -521,7 +530,12 @@ final class RecordingController: ObservableObject {
 
     /// Whether the current source selection includes a tap / a mic — drives which feed
     /// level sliders the UI shows.
-    var sourceHasTap: Bool { sources.first(where: { $0.id == selectedSourceID })?.makeTarget() != nil }
+    ///
+    /// Read from `body`, so it runs on every SwiftUI view update — which, while recording,
+    /// is 30× a second as the meters publish. It must stay a cheap lookup: it used to call
+    /// `makeTarget()`, which for an app source re-ran a full HAL process enumeration
+    /// (a synchronous mach round-trip to coreaudiod per audio process) on the main thread.
+    var sourceHasTap: Bool { sources.first(where: { $0.id == selectedSourceID })?.isTap ?? false }
     var sourceHasMic: Bool { selectedMic != nil }
 
     func revealLastFile() {

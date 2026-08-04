@@ -207,6 +207,9 @@ func runSpectrumSelfTest() {
 
     // (frequency, amplitude, dBFS label) — sweep levels to mimic real, quieter audio.
     let cases: [(Double, Double, String)] = [
+        // 1007.8125 Hz is bin 43 exactly (48 kHz / 2048), so it carries no scalloping
+        // loss — that's the tone the meter's calibration is trimmed against.
+        (1007.8125, 0.5, "-6 dBFS (on-bin)"),
         (1000, 1.0, "0 dBFS"), (1000, 0.1, "-20 dBFS"), (1000, 0.01, "-40 dBFS"),
         (100, 0.3, "-10 dBFS"), (8000, 0.3, "-10 dBFS"),
     ]
@@ -221,12 +224,26 @@ func runSpectrumSelfTest() {
         for _ in 0..<4 { meter.ingest(abl, frames: frames) } // let smoothing settle
         let levels = meter.levels()
         meter.reset()
+        // Invert the meter's own mapping so the read-out is in dBFS: the band carrying
+        // the tone should land within a dB or two of the tone's own level, which is what
+        // makes the LEDs usable as record-level feedback rather than a light show.
+        let span = SpectrumMeter.ceilingDB - SpectrumMeter.floorDB
         print("\n\(Int(freq)) Hz @ \(label):")
         for (i, l) in levels.enumerated() where l > 0.01 {
             let bar = String(repeating: "█", count: Int(l * 30))
-            print("  \(labels[i].padding(toLength: 4, withPad: " ", startingAt: 0)) \(String(format: "%.3f", l)) \(bar)")
+            let db = SpectrumMeter.floorDB + l * span
+            print("  \(labels[i].padding(toLength: 4, withPad: " ", startingAt: 0)) "
+                  + "\(String(format: "%.3f", l)) \(String(format: "%6.1f dBFS", db)) \(bar)")
         }
     }
+
+    // Silence must read as *exactly* zero on every band, or the bottom LED of each
+    // column stays lit for the life of the recording and the meter always looks busy.
+    for i in 0..<frames { data[i * 2] = 0; data[i * 2 + 1] = 0 }
+    for _ in 0..<200 { meter.ingest(abl, frames: frames) }
+    let quiet = meter.levels()
+    let allZero = quiet.allSatisfy { $0 == 0 }
+    print("\nSilence decays to zero: \(allZero ? "✓ PASS" : "✗ FAIL — \(quiet)")")
 }
 
 // MARK: - Diagnostics helpers
