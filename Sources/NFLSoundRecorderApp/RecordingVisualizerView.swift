@@ -212,6 +212,13 @@ struct DeckButton: View {
 /// producing the geometric figure made by two simultaneous signals. A mono signal
 /// naturally collapses toward the diagonal, while phase and stereo relationships draw
 /// the characteristic ellipses, loops, and more complex Lissajous figures.
+///
+/// Built from retained `Shape`s rather than a `Canvas`. `Canvas` was the original
+/// implementation and drew nothing here: it is an immediate-mode surface that only
+/// repaints when its host gives it a display pass, and the `MenuBarExtra(.window)`
+/// popover this panel lives in does not reliably do that. It was also the *only*
+/// `Canvas` in the app, which is why the scope was the only meter that stayed blank
+/// while the LED bars beside it — plain `Shape`s — animated normally.
 struct LissajousScopeView: View {
     let left: [Float]
     let right: [Float]
@@ -220,60 +227,85 @@ struct LissajousScopeView: View {
     private let cyan = Color(red: 0.15, green: 0.85, blue: 1.0)
 
     var body: some View {
-        Canvas { ctx, size in
-            let w = size.width, h = size.height
-            let center = CGPoint(x: w / 2, y: h / 2)
-            let radius = min(w, h) * 0.43
-
+        ZStack {
             // Oscilloscope graticule: center axes, quarter divisions, and a circular
             // plotting boundary make the X/Y relationship legible without labels.
-            var grid = Path()
-            grid.addEllipse(in: CGRect(x: center.x - radius, y: center.y - radius,
-                                       width: radius * 2, height: radius * 2))
-            grid.addEllipse(in: CGRect(x: center.x - radius * 0.5, y: center.y - radius * 0.5,
-                                       width: radius, height: radius))
-            grid.move(to: CGPoint(x: center.x - radius, y: center.y))
-            grid.addLine(to: CGPoint(x: center.x + radius, y: center.y))
-            grid.move(to: CGPoint(x: center.x, y: center.y - radius))
-            grid.addLine(to: CGPoint(x: center.x, y: center.y + radius))
-            for fraction: CGFloat in [-0.5, 0.5] {
-                let x = center.x + radius * fraction
-                let y = center.y + radius * fraction
-                grid.move(to: CGPoint(x: x, y: center.y - 3))
-                grid.addLine(to: CGPoint(x: x, y: center.y + 3))
-                grid.move(to: CGPoint(x: center.x - 3, y: y))
-                grid.addLine(to: CGPoint(x: center.x + 3, y: y))
-            }
-            ctx.stroke(grid, with: .color(.white.opacity(0.10)), lineWidth: 1)
+            ScopeGraticule()
+                .stroke(Color.white.opacity(0.10), lineWidth: 1)
 
-            let n = min(left.count, right.count)
-            guard n > 1 else { return }
-
-            // Auto-scale the current window while preserving the left/right amplitude
-            // relationship. X is left; Y is right, with screen Y inverted for Cartesian
-            // orientation. The path follows successive sample pairs through the figure.
-            var peak: Float = 0
-            for i in 0..<n {
-                peak = max(peak, max(abs(left[i]), abs(right[i])))
-            }
-            guard peak > 0.0002 else { return }
-            let scale = radius / CGFloat(peak)
-            var path = Path()
-            for i in 0..<n {
-                let x = center.x + CGFloat(left[i]) * scale
-                let y = center.y - CGFloat(right[i]) * scale
-                if i == 0 { path.move(to: CGPoint(x: x, y: y)) }
-                else { path.addLine(to: CGPoint(x: x, y: y)) }
-            }
-            // Layered strokes: cyan halo → green mid → bright green core (phosphor look).
-            ctx.stroke(path, with: .color(cyan.opacity(0.18)), lineWidth: 5)
-            ctx.stroke(path, with: .color(green.opacity(0.40)), lineWidth: 2.2)
-            ctx.stroke(path, with: .color(green.opacity(0.95)), lineWidth: 1)
+            // Layered strokes: cyan halo -> green mid -> bright green core (phosphor look).
+            ScopeTrace(left: left, right: right)
+                .stroke(cyan.opacity(0.18), lineWidth: 5)
+            ScopeTrace(left: left, right: right)
+                .stroke(green.opacity(0.40), lineWidth: 2.2)
+            ScopeTrace(left: left, right: right)
+                .stroke(green.opacity(0.95), lineWidth: 1)
         }
         .frame(maxWidth: .infinity)
         .frame(height: 140)
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// The fixed graticule. Kept as its own `Shape` so it is not rebuilt with every meter
+/// frame the way the trace is.
+private struct ScopeGraticule: Shape {
+    func path(in rect: CGRect) -> Path {
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) * 0.43
+        var p = Path()
+        p.addEllipse(in: CGRect(x: center.x - radius, y: center.y - radius,
+                                width: radius * 2, height: radius * 2))
+        p.addEllipse(in: CGRect(x: center.x - radius * 0.5, y: center.y - radius * 0.5,
+                                width: radius, height: radius))
+        p.move(to: CGPoint(x: center.x - radius, y: center.y))
+        p.addLine(to: CGPoint(x: center.x + radius, y: center.y))
+        p.move(to: CGPoint(x: center.x, y: center.y - radius))
+        p.addLine(to: CGPoint(x: center.x, y: center.y + radius))
+        for fraction: CGFloat in [-0.5, 0.5] {
+            let x = center.x + radius * fraction
+            let y = center.y + radius * fraction
+            p.move(to: CGPoint(x: x, y: center.y - 3))
+            p.addLine(to: CGPoint(x: x, y: center.y + 3))
+            p.move(to: CGPoint(x: center.x - 3, y: y))
+            p.addLine(to: CGPoint(x: center.x + 3, y: y))
+        }
+        return p
+    }
+}
+
+/// The live trace: successive (left, right) sample pairs joined into a single path, which
+/// is what turns a pile of samples into the figure rather than a scatter of dots.
+private struct ScopeTrace: Shape {
+    let left: [Float]
+    let right: [Float]
+
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let n = min(left.count, right.count)
+        guard n > 1 else { return p }
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = min(rect.width, rect.height) * 0.43
+
+        // Auto-scale the current window while preserving the left/right amplitude
+        // relationship, so a quiet passage still draws a full-size figure instead of a
+        // dot at the origin. Below the floor there is nothing meaningful to draw.
+        var peak: Float = 0
+        for i in 0..<n {
+            peak = max(peak, max(abs(left[i]), abs(right[i])))
+        }
+        guard peak > 0.0002 else { return p }
+        let scale = radius / CGFloat(peak)
+
+        // X is left; Y is right, with screen Y inverted for Cartesian orientation.
+        for i in 0..<n {
+            let x = center.x + CGFloat(left[i]) * scale
+            let y = center.y - CGFloat(right[i]) * scale
+            if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
+            else { p.addLine(to: CGPoint(x: x, y: y)) }
+        }
+        return p
     }
 }
 
