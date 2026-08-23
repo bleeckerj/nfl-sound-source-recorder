@@ -246,6 +246,128 @@ func runSpectrumSelfTest() {
     print("\nSilence decays to zero: \(allZero ? "✓ PASS" : "✗ FAIL — \(quiet)")")
 }
 
+/// Verifies the scope ring preserves the *stereo relationship* between channels.
+/// A Lissajous figure only exists if L and R stay independent and time-aligned: if the
+/// ring smears, duplicates, or de-phases them the trace collapses to a line and the
+/// display looks broken even though the audio is fine.
+func runScopeSelfTest() {
+    let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 2, interleaved: true)!
+    let frames = 512
+    let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: AVAudioFrameCount(frames))!
+    buf.frameLength = AVAudioFrameCount(frames)
+    let abl = UnsafeMutableAudioBufferListPointer(buf.mutableAudioBufferList)
+    let data = abl[0].mData!.assumingMemoryBound(to: Float.self)
+
+    // (label, right-channel phase offset, frequency ratio, expected figure)
+    let cases: [(String, Double, Double, String)] = [
+        ("mono (R = L)",           0,               1, "diagonal line"),
+        ("90° phase (R = cos)",    Double.pi / 2,   1, "circle"),
+        ("180° (R = -L)",          Double.pi,       1, "anti-diagonal"),
+        ("2:1 ratio",              0,               2, "figure-8"),
+    ]
+
+    for (label, phaseOffset, ratio, expected) in cases {
+        let scope = StereoScope()
+        var phase = 0.0
+        let inc = 2 * Double.pi * 440 / 48_000
+        // Push several buffers so the ring wraps at least once — that is where an
+        // off-by-one in the write index would show up.
+        for _ in 0..<8 {
+            for i in 0..<frames {
+                data[i * 2]     = Float(sin(phase) * 0.5)
+                data[i * 2 + 1] = Float(sin(phase * ratio + phaseOffset) * 0.5)
+                phase += inc
+            }
+            scope.ingest(abl, frames: frames)
+        }
+        let s = scope.snapshot()
+        let n = min(s.left.count, s.right.count)
+
+        // Pearson correlation between the channels: ±1 means the figure has collapsed to
+        // a straight line, near 0 means a genuinely open figure (circle / 8).
+        var sumL = 0.0, sumR = 0.0
+        for i in 0..<n { sumL += Double(s.left[i]); sumR += Double(s.right[i]) }
+        let mL = sumL / Double(n), mR = sumR / Double(n)
+        var cov = 0.0, varL = 0.0, varR = 0.0
+        for i in 0..<n {
+            let dl = Double(s.left[i]) - mL, dr = Double(s.right[i]) - mR
+            cov += dl * dr; varL += dl * dl; varR += dr * dr
+        }
+        let corr = (varL > 0 && varR > 0) ? cov / (varL * varR).squareRoot() : 0
+        let peakL = s.left.map(abs).max() ?? 0
+        let peakR = s.right.map(abs).max() ?? 0
+        // Distinct (x,y) points: a collapsed or single-valued ring yields very few.
+        var distinct = Set<Int>()
+        for i in 0..<n {
+            distinct.insert(Int(s.left[i] * 200) &* 1000 &+ Int(s.right[i] * 200))
+        }
+        print("\n\(label) — expect \(expected)")
+        print(String(format: "  peak L %.3f  peak R %.3f  correlation %+.3f  distinct points %d",
+                     peakL, peakR, corr, distinct.count))
+        let drawable = peakL > 0.0002 && peakR > 0.0002 && distinct.count > 8
+        print("  ring yields a drawable figure: \(drawable ? "✓ PASS" : "✗ FAIL")")
+    }
+
+    // Non-interleaved layout: a Core Audio tap commonly hands over two single-channel
+    // buffers rather than one interleaved pair. If that branch mis-reads the second
+    // buffer the figure silently degenerates to the mono diagonal, which looks exactly
+    // like "the scope is broken" even though audio is flowing.
+    let niFmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                              channels: 2, interleaved: false)!
+    let niBuf = AVAudioPCMBuffer(pcmFormat: niFmt, frameCapacity: AVAudioFrameCount(frames))!
+    niBuf.frameLength = AVAudioFrameCount(frames)
+    let niABL = UnsafeMutableAudioBufferListPointer(niBuf.mutableAudioBufferList)
+    let niScope = StereoScope()
+    var niPhase = 0.0
+    let niInc = 2 * Double.pi * 440 / 48_000
+    for _ in 0..<8 {
+        let lch = niABL[0].mData!.assumingMemoryBound(to: Float.self)
+        let rch = niABL[1].mData!.assumingMemoryBound(to: Float.self)
+        for i in 0..<frames {
+            lch[i] = Float(sin(niPhase) * 0.5)
+            rch[i] = Float(cos(niPhase) * 0.5)   // 90° apart => must trace a circle
+            niPhase += niInc
+        }
+        niScope.ingest(niABL, frames: frames)
+    }
+    let ni = niScope.snapshot()
+    var niCov = 0.0, niVarL = 0.0, niVarR = 0.0
+    for i in 0..<ni.left.count {
+        niCov += Double(ni.left[i]) * Double(ni.right[i])
+        niVarL += Double(ni.left[i]) * Double(ni.left[i])
+        niVarR += Double(ni.right[i]) * Double(ni.right[i])
+    }
+    let niCorr = (niVarL > 0 && niVarR > 0) ? niCov / (niVarL * niVarR).squareRoot() : 1
+    let niPeakR = ni.right.map(abs).max() ?? 0
+    print(String(format: "\nNon-interleaved (2 buffers) circle: peak R %.3f correlation %+.3f %@",
+                 niPeakR, niCorr,
+                 (niPeakR > 0.0002 && abs(niCorr) < 0.2) ? "✓ PASS" : "✗ FAIL (R channel misread)"))
+
+    // Continuity: consecutive samples must be adjacent in time, or the path drawn through
+    // them zig-zags across the screen instead of tracing the figure.
+    let scope = StereoScope()
+    var phase = 0.0
+    let inc = 2 * Double.pi * 440 / 48_000
+    for _ in 0..<8 {
+        for i in 0..<frames {
+            data[i * 2] = Float(sin(phase) * 0.5)
+            data[i * 2 + 1] = Float(cos(phase) * 0.5)
+            phase += inc
+        }
+        scope.ingest(abl, frames: frames)
+    }
+    let s = scope.snapshot()
+    var maxJump: Float = 0
+    for i in 1..<s.left.count {
+        maxJump = max(maxJump, abs(s.left[i] - s.left[i - 1]))
+    }
+    // One sample of 440 Hz at 48 kHz moves ~0.029 of full scale; anything far above that
+    // means the snapshot is not in time order.
+    print(String(format: "\nSample-to-sample continuity: max jump %.4f %@",
+                 maxJump, maxJump < 0.05 ? "✓ PASS" : "✗ FAIL (ring is out of order)"))
+}
+
+
 // MARK: - Diagnostics helpers
 
 
@@ -288,6 +410,11 @@ if hasFlag("--check-permission") {
 
 if hasFlag("--selftest-spectrum") {
     runSpectrumSelfTest()
+    exit(0)
+}
+
+if hasFlag("--selftest-scope") {
+    runScopeSelfTest()
     exit(0)
 }
 
