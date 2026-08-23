@@ -246,8 +246,11 @@ final class AudioMonitor {
 
     func stop() {
         if deviceID != 0, let procID {
-            AudioDeviceStop(deviceID, procID)
-            AudioDeviceDestroyIOProcID(deviceID, procID)
+            let id = deviceID
+            CA.withTimeout(context: "AudioDeviceStop (monitor)") {
+                AudioDeviceStop(id, procID)
+                AudioDeviceDestroyIOProcID(id, procID)
+            }
         }
         deviceID = 0
         procID = nil

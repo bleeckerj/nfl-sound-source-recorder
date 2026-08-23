@@ -98,7 +98,7 @@ Both the apps list and the output-device list are enumerated **live** every time
 
 ## MCP server (LLM integration)
 
-The server speaks MCP over stdio and exposes five tools:
+The server speaks MCP over stdio and exposes eleven tools:
 
 | Tool | Purpose |
 |------|---------|
@@ -107,8 +107,12 @@ The server speaks MCP over stdio and exposes five tools:
 | `list_input_devices` | Live list of microphones/inputs: `name`, `uid`, `channels`, `isDefault`. |
 | `start_recording` | Start capture + route. Args: `source` (`"system"`, a bundle id, or `"microphone"` for mic-only), optional `pid`, `microphone` (`"default"` or an input uid, to mix the mic in), `source_level_db`/`mic_level_db` (balance the feeds), `output_uid` (`"none"` to record only), `mute`, `file_path`. |
 | `set_equalizer` | Enable/disable the 10-band EQ and set per-band gains in dB (bands 32 Hz–16 kHz). Applies live. |
+| `pause_recording` | Pause file writing while keeping capture and monitoring active. |
+| `resume_recording` | Resume a paused recording. |
+| `set_routing_device` | Change the live output device, or pass `"none"` to keep recording without routing. |
+| `set_recording_levels` | Change source and/or microphone gain in dB while recording. |
 | `stop_recording` | Stop and return the saved file path + duration. |
-| `recording_status` | Whether a recording is in progress, with source/device/file/elapsed + EQ state. |
+| `recording_status` | Whether a recording is in progress, with paused state, source/device/file/elapsed, meters, and EQ state. |
 
 Build it. Bundling as a `.app` (recommended) gives the server a stable identity and the `NSAudioCaptureUsageDescription` the OS needs for the audio-capture prompt:
 
@@ -132,6 +136,27 @@ Register it with an MCP client. For Claude Desktop, add to `~/Library/Applicatio
 ```
 
 A typical LLM flow: call `list_applications` and `list_output_devices` to see what's available, then `start_recording` with a chosen `source` + `output_uid`, then `stop_recording`. To capture commentary too, add `microphone: "default"` (and balance with `source_level_db`/`mic_level_db`); to record just the mic, use `source: "microphone"`.
+
+The MCP executable is a separate front end to the shared recorder engine. A recording started through MCP is controlled through that MCP session; a recording started from the menu-bar app is not automatically attached to it.
+
+For a remote Mac, an MCP client can launch the same stdio server through SSH:
+
+```json
+{
+  "mcpServers": {
+    "remote-tapdeck": {
+      "command": "ssh",
+      "args": ["user@remote-mac", "/Users/user/nfl-sound-source-recorder/dist/TapDeck MCP.app/Contents/MacOS/nfl-sound-recorder-mcp"]
+    }
+  }
+}
+```
+
+Run the protocol smoke test without starting an audio capture:
+
+```sh
+./Scripts/test-mcp.sh
+```
 
 > **Permission:** `start_recording` taps audio, which is TCC-gated (its own TCC category, shown under **Screen & System Audio Recording**). Adding a `microphone` also needs **Microphone** consent. Both are attributed to whatever process launches the server (e.g. the MCP client). Grant them in **System Settings ▸ Privacy & Security** (under **Screen & System Audio Recording** and **Microphone**), or that feed captures silence. The listing tools need no permission.
 

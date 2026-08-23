@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Combine
+import CoreAudio
 import SoundRecorderKit
 
 enum VizMode: String, CaseIterable, Identifiable {
@@ -15,6 +16,11 @@ struct SourceOption: Identifiable, Hashable {
     let id: String
     let label: String
     let icon: NSImage?
+    /// Whether this source taps process audio. Stored rather than derived by *calling*
+    /// `makeTarget()`: that closure re-enumerates the HAL (a blocking IPC round-trip per
+    /// audio process), which is fine at record time but ruinous when the UI asks the
+    /// question during a view update. See `RecordingController.sourceHasTap`.
+    let isTap: Bool
     let makeTarget: @Sendable () -> ProcessTapRecorder.Target?
 
     static func == (lhs: SourceOption, rhs: SourceOption) -> Bool { lhs.id == rhs.id }
@@ -52,36 +58,56 @@ final class RecordingController: ObservableObject {
             if isRecording && oldValue != selectedDeviceUID { applyRoutingChange() }
         }
     }
-    @Published var mute = false
-    @Published var recordLevelDB: Double = 0
+    @Published var mute = false { didSet { Prefs.set(mute, Prefs.mute) } }
+    @Published var recordLevelDB: Double = 0 { didSet { Prefs.set(recordLevelDB, Prefs.recordLevel) } }
     /// Per-feed levels (dB) for balancing a mix; shown for the active feed(s).
-    @Published var sourceLevelDB: Double = 0
-    @Published var micLevelDB: Double = 0
-    @Published var recordingFormat: RecordingFormat = .caf
+    @Published var sourceLevelDB: Double = 0 { didSet { Prefs.set(sourceLevelDB, Prefs.sourceLevel) } }
+    @Published var micLevelDB: Double = 0 { didSet { Prefs.set(micLevelDB, Prefs.micLevel) } }
+    /// AAC by default (small files); the choice is persisted across launches — see `Prefs`.
+    @Published var recordingFormat: RecordingFormat = .aac {
+        didSet { Prefs.set(recordingFormat.rawValue, Prefs.format) }
+    }
 
-    @Published var eqEnabled = true
-    @Published var eqGains: [Double] = Array(repeating: 0, count: GraphicEQ.bandCount)
+    @Published var eqEnabled = true { didSet { Prefs.set(eqEnabled, Prefs.eqEnabled) } }
+    @Published var eqGains: [Double] = Array(repeating: 0, count: GraphicEQ.bandCount) {
+        didSet { Prefs.set(eqGains, Prefs.eqGains) }
+    }
+
+    /// Folder new recordings are written to. User-settable (see `chooseRecordingsDirectory`)
+    /// and persisted across launches; defaults to ~/Music/TapDeck.
+    @Published var recordingsDirectory: URL = RecordingController.defaultRecordingsDirectory {
+        didSet { Prefs.set(recordingsDirectory.path, Prefs.recordingsDir) }
+    }
+
+    /// The built-in default recordings location.
+    static var defaultRecordingsDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Music/TapDeck", isDirectory: true)
+    }
 
     @Published var isRecording = false
     @Published var isPaused = false
-    @Published var elapsedText = "00:00"
     @Published var statusText = "Idle"
-    @Published var bandLevels: [Float] = Array(repeating: 0, count: SpectrumMeter.bandCount)
-    @Published var bandPeaks: [Float] = Array(repeating: 0, count: SpectrumMeter.bandCount)
     @Published var vizMode: VizMode = .bars
-    @Published var scopeLeft: [Float] = []
-    @Published var scopeRight: [Float] = []
-    /// Rotation (degrees) for the menu-bar cassette reels; advances while recording.
-    @Published var iconAngle: Double = 0
-    /// Smoothed live audio level (0...1) driving the menu-bar icon — the reels spin
-    /// faster and the hub pulses as the captured signal gets louder.
-    @Published var iconLevel: Double = 0
     @Published var lastError: String?
     @Published var lastFileURL: URL?
+
+    /// Everything the 30 Hz tick rewrites — meters, reels, elapsed clock. A separate
+    /// object (not `@Published` here, so mutating it never invalidates the panel) observed
+    /// only by the views that draw it. See `MeterState`.
+    let meters = MeterState()
 
     private var recorder: ProcessTapRecorder?
     private var timer: Timer?
     private var startDate: Date?
+    /// Serializes every blocking Core Audio lifecycle op (start / stop / reroute / device
+    /// enumeration) OFF the main thread, so a wedged audio server can never beachball the UI.
+    private let audioQueue = DispatchQueue(label: "com.nfl.soundrecorder.control", qos: .userInitiated)
+    /// Bumped on every start/stop so an in-flight async start whose result lands after the
+    /// user already stopped (or restarted) is torn down instead of applied.
+    private var lifecycleGeneration = 0
+    /// Coalesces overlapping refreshes when the menu is opened rapidly.
+    private var isRefreshing = false
     /// When the current pause began, and total time spent paused, so elapsed time
     /// reflects tape actually written rather than wall-clock since Record.
     private var pausedAt: Date?
@@ -93,26 +119,73 @@ final class RecordingController: ObservableObject {
     /// Whether the current recording includes the mic (for the feedback hint).
     private var recordingHasMic = false
 
-    /// Rebuild the source + device lists (call whenever the menu opens).
+    init() {
+        // Warm up the Core Audio HAL on the MAIN thread. The HAL's one-time bootstrap
+        // (HALSystem::InitializeDevices) must run on the main thread's run loop; if the very
+        // first HAL access instead happens on a background queue — as our off-main `refresh()`
+        // enumeration otherwise would — it deadlocks in semaphore_wait and the device/source
+        // lists never populate. Touching it once here (init runs on the main actor at launch)
+        // guarantees all later off-main enumeration/teardown hits an already-initialized HAL.
+        _ = try? AudioSystem.defaultOutputDevice()
+
+        // Restore persisted preferences. (Assignments in init don't fire the didSet
+        // observers, so this loads without immediately re-saving.)
+        let d = UserDefaults.standard
+        if let raw = d.string(forKey: Prefs.format), let f = RecordingFormat(rawValue: raw) {
+            recordingFormat = f
+        }
+        if d.object(forKey: Prefs.mute) != nil { mute = d.bool(forKey: Prefs.mute) }
+        if d.object(forKey: Prefs.eqEnabled) != nil { eqEnabled = d.bool(forKey: Prefs.eqEnabled) }
+        if let g = d.array(forKey: Prefs.eqGains) as? [Double], g.count == eqGains.count { eqGains = g }
+        if d.object(forKey: Prefs.recordLevel) != nil { recordLevelDB = d.double(forKey: Prefs.recordLevel) }
+        if d.object(forKey: Prefs.sourceLevel) != nil { sourceLevelDB = d.double(forKey: Prefs.sourceLevel) }
+        if d.object(forKey: Prefs.micLevel) != nil { micLevelDB = d.double(forKey: Prefs.micLevel) }
+        if let p = d.string(forKey: Prefs.recordingsDir), !p.isEmpty {
+            recordingsDirectory = URL(fileURLWithPath: p, isDirectory: true)
+        }
+    }
+
+    /// Rebuild the source + device lists (call whenever the menu opens). The blocking HAL
+    /// enumeration — per-device and per-process property queries — runs off the main thread
+    /// so a wedged audio server can't freeze the menu; results are published back on main.
     func refresh() {
-        do {
-            devices = try AudioSystem.outputDevices()
-            let currentDefault = try? AudioSystem.defaultOutputDevice()
+        guard !isRefreshing else { return }   // coalesce rapid re-opens
+        isRefreshing = true
+        audioQueue.async { [weak self] in
+            let outputs = try? AudioSystem.outputDevices()
+            let defaultOut = try? AudioSystem.defaultOutputDevice()
+            let inputs = (try? AudioSystem.inputDevices()) ?? []
+            let catalog = AudioProcesses.catalog()
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.applyEnumeration(outputs: outputs, defaultOut: defaultOut,
+                                      inputs: inputs, catalog: catalog)
+                self.isRefreshing = false
+            }
+        }
+    }
+
+    /// Publish freshly-enumerated devices/sources and reconcile the current selections.
+    /// Runs on the main actor; icon lookup (`NSRunningApplication`) is main-affine.
+    private func applyEnumeration(outputs: [AudioDeviceInfo]?, defaultOut: AudioObjectID?,
+                                  inputs: [AudioDeviceInfo], catalog: AudioSourceCatalog) {
+        if let outputs {
+            devices = outputs
             // Keep an explicit "record only" choice; otherwise fall back to a real device.
             if selectedDeviceUID.isEmpty
                 || (selectedDeviceUID != Self.noRouteUID
-                    && !devices.contains(where: { $0.uid == selectedDeviceUID })) {
-                selectedDeviceUID = devices.first(where: { $0.id == currentDefault })?.uid
-                    ?? devices.first?.uid ?? ""
+                    && !outputs.contains(where: { $0.uid == selectedDeviceUID })) {
+                selectedDeviceUID = outputs.first(where: { $0.id == defaultOut })?.uid
+                    ?? outputs.first?.uid ?? ""
             }
-        } catch {
-            lastError = "\(error)"
+        } else {
+            lastError = "Could not enumerate output devices."
         }
 
         // Input devices (microphones). Keep the "off" choice; drop a stale device.
-        inputDevices = (try? AudioSystem.inputDevices()) ?? []
+        inputDevices = inputs
         if selectedMicUID != Self.micOffUID
-            && !inputDevices.contains(where: { $0.uid == selectedMicUID }) {
+            && !inputs.contains(where: { $0.uid == selectedMicUID }) {
             selectedMicUID = Self.micOffUID
         }
 
@@ -121,45 +194,46 @@ final class RecordingController: ObservableObject {
                 id: "system",
                 label: "All System Audio",
                 icon: NSImage(systemSymbolName: "speaker.wave.3.fill", accessibilityDescription: nil),
+                isTap: true,
                 makeTarget: { .systemWide }
             ),
             SourceOption(
                 id: Self.micOnlySourceID,
                 label: "None — microphone only",
                 icon: NSImage(systemSymbolName: "mic.slash.fill", accessibilityDescription: nil),
+                isTap: false,
                 makeTarget: { nil }
             )
         ]
-        for app in AudioProcesses.list() {
+        // One row per Dock application; its audio helpers (browser renderers etc.)
+        // are folded in and tapped as a group at record time — re-resolved then,
+        // because helpers can spawn between menu-open and Record.
+        for app in catalog.apps {
             let pid = app.pid
-            let icon = NSRunningApplication(processIdentifier: pid)?.icon
-            let label = Self.sourceLabel(for: app)
+            let bundleID = app.bundleID
             options.append(SourceOption(
-                id: "\(app.bundleID):\(pid)",
-                label: label,
-                icon: icon,
-                makeTarget: {
-                    let targetPID = AudioProcesses.bestMatch(bundleID: app.bundleID)?.pid ?? pid
-                    return .pid(targetPID)
-                }
+                id: bundleID,
+                label: app.isPlaying ? "\(app.name) — playing" : app.name,
+                icon: NSRunningApplication(processIdentifier: pid)?.icon,
+                isTap: true,
+                makeTarget: { .pids(AudioProcesses.app(matching: bundleID)?.tapPIDs ?? [pid]) }
+            ))
+        }
+        // A daemon earns a row only while it is audibly producing output; idle
+        // HAL registrants (mediaremoted, corespeechd, …) stay hidden. So do we:
+        // while routing, our own output "plays", but we must never tap ourselves.
+        for daemon in catalog.daemons where daemon.isPlaying && daemon.pid != getpid() {
+            let pid = daemon.pid
+            options.append(SourceOption(
+                id: "daemon:\(daemon.bundleID):\(pid)",
+                label: "\(daemon.name) — playing",
+                icon: NSImage(systemSymbolName: "gearshape.2", accessibilityDescription: nil),
+                isTap: true,
+                makeTarget: { .pid(pid) }
             ))
         }
         sources = options
         if !sources.contains(where: { $0.id == selectedSourceID }) { selectedSourceID = "system" }
-    }
-
-    private static func sourceLabel(for app: AudioProcessInfo) -> String {
-        let name = app.name == app.bundleID ? friendlyBundleName(app.bundleID) : app.name
-        let state = app.isPlaying ? "playing" : "idle - no signal now"
-        return "\(name) - \(state) (pid \(app.pid))"
-    }
-
-    private static func friendlyBundleName(_ bundleID: String) -> String {
-        let parts = bundleID.split(separator: ".").map(String.init)
-        if parts.count >= 2, parts.last?.lowercased() == "helper" {
-            return "\(parts[parts.count - 2]) Helper"
-        }
-        return parts.last ?? bundleID
     }
 
     /// The microphone device currently selected, or nil for "off".
@@ -268,41 +342,77 @@ final class RecordingController: ObservableObject {
             device = picked
         }
 
-        let url = Self.newFileURL(format: recordingFormat)
+        let url = newFileURL(format: recordingFormat)
         let rec = ProcessTapRecorder(source: captureSource, outputDevice: device, fileURL: url,
                                      format: recordingFormat, mute: mute,
                                      driftCompensation: false)
-        do {
-            try rec.start()
-            rec.equalizer.setGains(eqGains)
-            rec.equalizer.setEnabled(eqEnabled)
-            rec.setRecordGain(dB: recordLevelDB)
-            rec.setSourceGain(dB: sourceLevelDB)
-            rec.setMicGain(dB: micLevelDB)
-            recorder = rec
-            startDate = Date()
-            pausedAt = nil
-            pausedTotal = 0
-            isPaused = false
-            lastFileURL = url
-            isRecording = true
-            recordingSourceLabel = sourceLabel
-            updateRecordingStatus(device: device)
-            // Schedule in .common mode so it keeps firing while the menu-bar popover
-            // is open (default-mode timers are paused during that tracking run loop).
-            let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-                Task { @MainActor in self?.tick() }
+
+        // Optimistic UI: flip to "recording" immediately so the menu stays responsive; the
+        // blocking HAL start runs off-main below and confirms (or reverts) when it returns.
+        lifecycleGeneration += 1
+        let gen = lifecycleGeneration
+        recordingSourceLabel = sourceLabel
+        lastFileURL = url
+        startDate = nil          // set on confirmation so the elapsed clock starts at 0
+        pausedAt = nil; pausedTotal = 0; isPaused = false
+        meters.elapsedText = "00:00"
+        isRecording = true
+        statusText = "Starting…"
+
+        // Snapshot the live settings to apply once the pipeline is up.
+        let gains = eqGains, eqOn = eqEnabled
+        let recDB = recordLevelDB, srcDB = sourceLevelDB, micDB = micLevelDB
+        let q = audioQueue
+
+        q.async { [weak self] in
+            let result = Result { try rec.start() }
+            if case .success = result {
+                rec.equalizer.setGains(gains)
+                rec.equalizer.setEnabled(eqOn)
+                rec.setRecordGain(dB: recDB)
+                rec.setSourceGain(dB: srcDB)
+                rec.setMicGain(dB: micDB)
             }
-            RunLoop.main.add(t, forMode: .common)
-            timer = t
-        } catch {
-            lastError = "\(error)"
-            statusText = "Idle"
+            Task { @MainActor in
+                guard let self else { q.async { rec.stop() }; return }
+                // Superseded (user stopped or restarted while starting): discard this one.
+                guard gen == self.lifecycleGeneration else { q.async { rec.stop() }; return }
+                switch result {
+                case .success:
+                    self.recorder = rec
+                    self.startDate = Date()
+                    self.updateRecordingStatus(device: device)
+                    self.startTickTimer()
+                case .failure(let error):
+                    self.isRecording = false
+                    self.lastError = "\(error)"
+                    self.statusText = "Idle"
+                    // start() tears itself down on throw — nothing to stop here.
+                }
+            }
         }
     }
 
+    /// Start the 30 Hz UI tick. Scheduled in `.common` mode so it keeps firing while the
+    /// menu-bar popover is open (default-mode timers are paused during that tracking loop).
+    private func startTickTimer() {
+        timer?.invalidate()
+        let t = Timer(timeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
+            // This timer is installed on RunLoop.main, so execute the tick in the
+            // callback. Enqueuing a MainActor Task here lets delayed UI work pile up
+            // at 30 tasks per second; the backlog makes the meters lag and keeps CPU
+            // busy long after the frame that created each task is useful.
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
+        }
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
+    }
+
     func stop() {
-        recorder?.stop()
+        lifecycleGeneration += 1      // invalidate any in-flight start
+        let rec = recorder
         recorder = nil
         timer?.invalidate()
         timer = nil
@@ -311,22 +421,37 @@ final class RecordingController: ObservableObject {
         pausedTotal = 0
         isRecording = false
         isPaused = false
-        bandLevels = Array(repeating: 0, count: SpectrumMeter.bandCount)
-        bandPeaks = Array(repeating: 0, count: SpectrumMeter.bandCount)
-        scopeLeft = []
-        scopeRight = []
-        iconLevel = 0
-        statusText = "Saved \(lastFileURL?.lastPathComponent ?? "recording")."
+        meters.reset()
+        let name = lastFileURL?.lastPathComponent ?? "recording"
+        // Tear down off-main: rec.stop() blocks on Core Audio and flushes+closes the file.
+        // The UI is already back to "stopped" so a wedged server can't beachball it.
+        if let rec {
+            statusText = "Saving \(name)…"
+            audioQueue.async { [weak self] in
+                rec.stop()
+                Task { @MainActor in
+                    // Only claim "Saved" if the user hasn't started a new recording since.
+                    guard let self, !self.isRecording else { return }
+                    self.statusText = "Saved \(name)."
+                }
+            }
+        } else {
+            // Nothing running yet (stop during "Starting…"); the in-flight start's
+            // completion tears its recorder down via the generation check above.
+            statusText = "Saved \(name)."
+        }
     }
 
     /// Reroute the in-progress recording to the currently-selected device (or to
-    /// record-only). Capture and file-writing continue uninterrupted across the change.
+    /// record-only). Capture and file-writing continue uninterrupted across the change;
+    /// the monitor teardown/rebuild runs off-main so the picker never blocks.
     private func applyRoutingChange() {
         let device: AudioDeviceInfo? = selectedDeviceUID == Self.noRouteUID
             ? nil
             : devices.first(where: { $0.uid == selectedDeviceUID })
-        recorder?.setRoutingDevice(device)
         updateRecordingStatus(device: device)
+        let rec = recorder
+        audioQueue.async { rec?.setRoutingDevice(device) }
     }
 
     /// Rebuild the "Recording …" status line for the given routing device.
@@ -396,7 +521,12 @@ final class RecordingController: ObservableObject {
 
     /// Whether the current source selection includes a tap / a mic — drives which feed
     /// level sliders the UI shows.
-    var sourceHasTap: Bool { sources.first(where: { $0.id == selectedSourceID })?.makeTarget() != nil }
+    ///
+    /// Read from `body`, so it runs on every SwiftUI view update — which, while recording,
+    /// is 30× a second as the meters publish. It must stay a cheap lookup: it used to call
+    /// `makeTarget()`, which for an app source re-ran a full HAL process enumeration
+    /// (a synchronous mach round-trip to coreaudiod per audio process) on the main thread.
+    var sourceHasTap: Bool { sources.first(where: { $0.id == selectedSourceID })?.isTap ?? false }
     var sourceHasMic: Bool { selectedMic != nil }
 
     func revealLastFile() {
@@ -404,18 +534,20 @@ final class RecordingController: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
+    /// Publishes a meter frame. Every write lands on `meters`, never on `self`, so a frame
+    /// invalidates only the cassette / meter / menu-bar-icon views rather than the whole panel.
     private func tick() {
         // Paused: hold the reels, meters, and clock where they are.
         guard !isPaused else { return }
         if let recorder {
             switch vizMode {
             case .bars:
-                bandLevels = recorder.spectrum.levels()
-                bandPeaks = recorder.spectrum.peakLevels()
+                meters.bandLevels = recorder.spectrum.levels()
+                meters.bandPeaks = recorder.spectrum.peakLevels()
             case .scope:
                 let s = recorder.scope.snapshot()
-                scopeLeft = s.left
-                scopeRight = s.right
+                meters.scopeLeft = s.left
+                meters.scopeRight = s.right
             }
         }
         // Smoothed live level (0...1) for the menu-bar icon's hub swell: map the
@@ -424,23 +556,74 @@ final class RecordingController: ObservableObject {
         let peak = recorder?.meter.takePeak() ?? 0
         let target = peak > 0 ? max(0, min(1, (LevelMeter.dBFS(peak) + 54) / 54)) : 0
         // Assymmetric smoothing: snap up on transients, decay slowly like a VU meter.
-        let ease = target > iconLevel ? 0.6 : 0.15
-        iconLevel += (target - iconLevel) * ease
+        let ease = target > meters.iconLevel ? 0.6 : 0.15
+        meters.iconLevel += (target - meters.iconLevel) * ease
         // Spin the reels at a *constant* rate — a real tape transport moves the tape at
         // a fixed speed regardless of the signal on it. Tying speed to level made the
         // reels surge and stall with the audio ("hurk-and-jerk"), so keep it steady.
-        iconAngle = (iconAngle + 6).truncatingRemainder(dividingBy: 360)
+        meters.iconAngle = (meters.iconAngle + 6).truncatingRemainder(dividingBy: 360)
         guard let startDate else { return }
         let seconds = Int(Date().timeIntervalSince(startDate) - pausedTotal)
-        elapsedText = String(format: "%02d:%02d", seconds / 60, seconds % 60)
+        meters.elapsedText = String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 
-    private static func newFileURL(format: RecordingFormat) -> URL {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Music/TapDeck", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    private func newFileURL(format: RecordingFormat) -> URL {
+        // Use the chosen directory, creating it if needed; fall back to the built-in default
+        // if that folder can't be created (e.g. it was deleted or is no longer writable).
+        var dir = recordingsDirectory
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        } catch {
+            let fallback = Self.defaultRecordingsDirectory
+            try? FileManager.default.createDirectory(at: fallback, withIntermediateDirectories: true)
+            lastError = "Couldn't use \(dir.path) — saving to \(fallback.path) instead."
+            dir = fallback
+        }
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
         return dir.appendingPathComponent("Recording \(formatter.string(from: Date())).\(format.fileExtension)")
     }
+
+    /// Present a folder picker for the recordings location. Runs modally on the main thread;
+    /// the choice is persisted via `recordingsDirectory`'s observer.
+    func chooseRecordingsDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = recordingsDirectory
+        panel.prompt = "Choose"
+        panel.message = "Choose where TapDeck saves recordings"
+        NSApp.activate(ignoringOtherApps: true)
+        if panel.runModal() == .OK, let url = panel.url {
+            recordingsDirectory = url
+        }
+    }
+
+    /// Reset the recordings location to the built-in default (~/Music/TapDeck).
+    func resetRecordingsDirectory() {
+        recordingsDirectory = Self.defaultRecordingsDirectory
+    }
+
+    /// Open the recordings folder in Finder.
+    func revealRecordingsDirectory() {
+        try? FileManager.default.createDirectory(at: recordingsDirectory, withIntermediateDirectories: true)
+        NSWorkspace.shared.activateFileViewerSelecting([recordingsDirectory])
+    }
+}
+
+/// UserDefaults-backed persistence for the menu-bar app's preferences, so the chosen format
+/// (and EQ / mute / feed levels) survive relaunch instead of silently resetting to defaults.
+/// Loaded in `RecordingController.init`; written from each property's `didSet`.
+private enum Prefs {
+    static let format = "recordingFormat"
+    static let mute = "mute"
+    static let eqEnabled = "eqEnabled"
+    static let eqGains = "eqGains"
+    static let recordLevel = "recordLevelDB"
+    static let sourceLevel = "sourceLevelDB"
+    static let micLevel = "micLevelDB"
+    static let recordingsDir = "recordingsDirectory"
+    static func set(_ value: Any, _ key: String) { UserDefaults.standard.set(value, forKey: key) }
 }

@@ -1,5 +1,6 @@
 import Foundation
 import CoreAudio
+import os
 
 /// Thin, throwing wrappers around the Core Audio HAL property API so the rest of
 /// the code reads like normal Swift instead of a wall of `AudioObjectGetPropertyData`.
@@ -15,6 +16,33 @@ enum CA {
 
     static func check(_ status: OSStatus, _ context: @autoclosure () -> String) throws {
         guard status == noErr else { throw Error(status: status, context: context()) }
+    }
+
+    // MARK: Teardown watchdog
+
+    private static let watchdogLog = Logger(subsystem: "com.nfl.soundrecorder", category: "watchdog")
+
+    /// Run a blocking HAL teardown call under a deadline so a wedged `coreaudiod` can never
+    /// hang the caller indefinitely. `work` runs on a detached thread; if it hasn't returned
+    /// within `seconds` we log, abandon it (leaking whatever it was tearing down), and return
+    /// so the app can still finalize its file and UI. Returns true if `work` finished in time.
+    ///
+    /// This is deliberately a last-resort guard: in normal operation teardown completes in
+    /// microseconds and the timeout never trips. Leaking a HAL object on the rare wedge is a
+    /// far better outcome than an unkillable beachball.
+    @discardableResult
+    static func withTimeout(_ seconds: Double = 3, context: String = "HAL teardown",
+                            _ work: @escaping @Sendable () -> Void) -> Bool {
+        let done = DispatchSemaphore(value: 0)
+        // Detached (not a pooled queue) so a permanently-stuck call can't starve a shared queue.
+        let thread = Thread { work(); done.signal() }
+        thread.stackSize = 512 * 1024
+        thread.start()
+        if done.wait(timeout: .now() + seconds) == .timedOut {
+            watchdogLog.error("\(context) exceeded \(seconds, format: .fixed(precision: 1))s — abandoning (leaked) to avoid a hang")
+            return false
+        }
+        return true
     }
 
     // MARK: Scalar / array property reads

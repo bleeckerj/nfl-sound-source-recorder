@@ -19,10 +19,20 @@ import os
 ///   3. Every captured buffer — tap, mixed, or mic — flows through one shared sink that
 ///      applies the EQ, feeds the routing ring, applies the master record level, writes
 ///      the file, and updates the meters.
-public final class ProcessTapRecorder {
+/// - Note: `@unchecked Sendable` because front-ends hand a recorder between threads (the
+///   menu-bar app runs every lifecycle call — `start`/`stop`/`setRoutingDevice` — on one
+///   serial control queue, off the main thread). The invariant that makes this safe: all
+///   mutable lifecycle state (tap/aggregate/IOProc ids, writer, monitor, mic, rings) is only
+///   ever touched under that single-serialized lifecycle path; the live setters are lock-
+///   guarded; and the metering objects read from the UI (`meter`/`spectrum`/`scope`) are
+///   independently thread-safe. Do not add unsynchronized mutable state read off that path.
+public final class ProcessTapRecorder: @unchecked Sendable {
 
     public enum Target {
         case pid(pid_t)
+        /// One app's whole process group (app + audio helpers), mixed down into
+        /// a single tap — see `AudioAppInfo.tapPIDs`.
+        case pids([pid_t])
         case systemWide
     }
 
@@ -82,9 +92,15 @@ public final class ProcessTapRecorder {
     private let sourceGainLock = OSAllocatedUnfairLock(initialState: Float(1))
     private let micGainLock = OSAllocatedUnfairLock(initialState: Float(1))
 
-    /// Set the record level in dB (0 dB = unity). Clamped to +36 dB.
+    /// At or below this the record level is off — true silence, not a very quiet signal.
+    /// A fader with no −∞ end can't actually mute, which makes "all the way down" a lie.
+    public static let recordLevelOffDB: Double = -60
+
+    /// Set the record level in dB (0 dB = unity). Clamped to +36 dB; at or below
+    /// `recordLevelOffDB` the gain is exactly zero.
     public func setRecordGain(dB: Double) {
-        gainLock.withLock { $0 = powf(10, Float(min(36, dB)) / 20) }
+        let g: Float = dB <= Self.recordLevelOffDB ? 0 : powf(10, Float(min(36, dB)) / 20)
+        gainLock.withLock { $0 = g }
     }
 
     /// Set the tap/system feed level in dB (0 dB = unity). Clamped to +36 dB.
@@ -114,7 +130,9 @@ public final class ProcessTapRecorder {
     private var tapUUID = ""
     private var aggregateID: AudioObjectID = 0
     private var ioProcID: AudioDeviceIOProcID?
-    private var audioFile: AVAudioFile?
+    /// Writes the file off the render thread — the IOProc only enqueues PCM. See
+    /// `AsyncAudioFileWriter` for why inline `AVAudioFile.write` caused the teardown hang.
+    private var writer: AsyncAudioFileWriter?
     /// The format the file, EQ, meters, and rings all work in: the tap format when a tap
     /// is present, otherwise the microphone's format (mic-only).
     private var captureFormat: AVAudioFormat?
@@ -148,7 +166,7 @@ public final class ProcessTapRecorder {
     ///     audio still plays during this window; only file-writing is held back. Set to
     ///     0 to keep the raw ramp.
     public init(source: Source, outputDevice: AudioDeviceInfo?, fileURL: URL,
-                format: RecordingFormat = .caf, mute: Bool,
+                format: RecordingFormat = .aac, mute: Bool,
                 driftCompensation: Bool = false, warmupSeconds: Double = 0.6) {
         self.source = source
         self.routingDevice = outputDevice
@@ -195,17 +213,43 @@ public final class ProcessTapRecorder {
         }
     }
 
+    /// Tear down the whole pipeline and finalize the file. Every blocking HAL call is
+    /// wrapped in a watchdog so a wedged `coreaudiod` can't hang the caller — see
+    /// `CA.withTimeout`. Ordering matters: stop the producing IOProcs first (so no more
+    /// frames arrive), then flush + close the writer, then destroy the aggregate/tap.
+    ///
+    /// Not real-time and can block briefly; callers with a UI (the menu-bar app) run this
+    /// off the main thread. The CLI/MCP call it on their own (non-UI) threads.
     public func stop() {
+        // 1. Stop the producers. AudioDeviceStop waits for the IOProc to go idle; the
+        //    watchdog bounds that wait.
         micCapture?.stop()
         micCapture = nil
         monitor?.stop()
         monitor = nil
         if aggregateID != 0, let ioProcID {
-            AudioDeviceStop(aggregateID, ioProcID)
-            AudioDeviceDestroyIOProcID(aggregateID, ioProcID)
+            let agg = aggregateID
+            CA.withTimeout(context: "AudioDeviceStop (aggregate)") {
+                AudioDeviceStop(agg, ioProcID)
+                AudioDeviceDestroyIOProcID(agg, ioProcID)
+            }
         }
-        if aggregateID != 0 { AudioHardwareDestroyAggregateDevice(aggregateID) }
-        if tapID != 0 { AudioHardwareDestroyProcessTap(tapID) }
+        // 2. No more enqueues can happen now — flush the remaining buffered audio and close.
+        writer?.finish()
+        writer = nil
+        // 3. Destroy the HAL objects.
+        if aggregateID != 0 {
+            let agg = aggregateID
+            CA.withTimeout(context: "AudioHardwareDestroyAggregateDevice") {
+                AudioHardwareDestroyAggregateDevice(agg)
+            }
+        }
+        if tapID != 0 {
+            let tap = tapID
+            CA.withTimeout(context: "AudioHardwareDestroyProcessTap") {
+                AudioHardwareDestroyProcessTap(tap)
+            }
+        }
         aggregateID = 0
         tapID = 0
         ioProcID = nil
@@ -213,7 +257,6 @@ public final class ProcessTapRecorder {
         micRing = nil
         captureSink = nil
         freeMixScratch()
-        audioFile = nil // finalizes the file
     }
 
     // MARK: Live routing
@@ -244,15 +287,25 @@ public final class ProcessTapRecorder {
 
     // MARK: Setup steps
 
+    /// A stereo mixdown tap over every resolvable process object among `pids`.
+    /// Some of an app's helper pids may have quit since enumeration — that's fine
+    /// as long as at least one still has a HAL process object.
+    private static func mixdownDescription(of pids: [pid_t]) throws -> CATapDescription {
+        let objects = pids.compactMap { try? AudioSystem.processObject(for: $0) }.filter { $0 != 0 }
+        guard !objects.isEmpty else {
+            let list = pids.map(String.init).joined(separator: ", ")
+            throw CA.Error(status: -1, context: "No audio process object for pid(s) \(list) (is it playing audio?)")
+        }
+        return CATapDescription(stereoMixdownOfProcesses: objects)
+    }
+
     private func createTap(target: Target) throws {
         let description: CATapDescription
         switch target {
         case .pid(let pid):
-            let processObject = try AudioSystem.processObject(for: pid)
-            guard processObject != 0 else {
-                throw CA.Error(status: -1, context: "No audio process object for pid \(pid) (is it playing audio?)")
-            }
-            description = CATapDescription(stereoMixdownOfProcesses: [processObject])
+            description = try Self.mixdownDescription(of: [pid])
+        case .pids(let pids):
+            description = try Self.mixdownDescription(of: pids)
         case .systemWide:
             // Exclude our OWN process from the global tap. Otherwise the audio we
             // route back out to the output device is itself "system audio", gets
@@ -352,8 +405,8 @@ public final class ProcessTapRecorder {
         // AVAudioFile converts float→int / PCM→compressed for us.
         let settings = format.settings(sampleRate: captureFormat.sampleRate,
                                        channels: captureFormat.channelCount)
-        audioFile = try AVAudioFile(forWriting: fileURL, settings: settings,
-                                    commonFormat: .pcmFormatFloat32, interleaved: true)
+        writer = try AsyncAudioFileWriter(fileURL: fileURL, settings: settings,
+                                          captureFormat: captureFormat)
         // Reusable buffer (capture format) for EQ processing; large enough for any IO cycle.
         scratch = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: 16_384)
         // Half a second of slack between the capture and routing clocks.
@@ -365,7 +418,7 @@ public final class ProcessTapRecorder {
     /// real-time blocks that call it never retain/release `self`.
     private func makeCaptureSink() {
         guard let captureFormat else { return }
-        let file = audioFile
+        let writer = self.writer
         let eq = equalizer
         let scratch = self.scratch
         let meter = self.meter
@@ -374,7 +427,6 @@ public final class ProcessTapRecorder {
         let gainLock = self.gainLock
         let pausedLock = self.pausedLock
         let ring = self.ring
-        let fmt = captureFormat
         // Skip the initial device-start ramp: hold off file-writing this many frames.
         let warmupFrames = UInt64(warmupSeconds * captureFormat.sampleRate)
 
@@ -393,13 +445,10 @@ public final class ProcessTapRecorder {
             // route at natural level, then record (with record gain applied).
             if !eq.isEnabled || frames == 0 || scratch == nil || frames > scratch!.frameCapacity {
                 ring?.write(abl, frames: frames)          // monitor at natural level, pre record-gain
-                if gain != 1 { scaleBuffers(abl, by: gain) }
-                if recordToFile, let file,
-                   let buffer = AVAudioPCMBuffer(pcmFormat: fmt, bufferListNoCopy: abl.unsafeMutablePointer, deallocator: nil) {
-                    try? file.write(from: buffer)
-                }
-                spectrum.ingest(abl, frames: frames)
+                spectrum.ingest(abl, frames: frames, gain: gain)
                 scope.ingest(abl, frames: frames)
+                if gain != 1 { scaleBuffers(abl, by: gain) }
+                if recordToFile { writer?.enqueue(abl, frames: frames) }   // off-thread write
                 return
             }
 
@@ -410,11 +459,11 @@ public final class ProcessTapRecorder {
             copyBuffers(from: abl, to: workABL)
             eq.process(workABL)
             ring?.write(workABL, frames: frames)          // monitor at EQ'd natural level, pre record-gain
-            if gain != 1 { scaleBuffers(workABL, by: gain) }
-            if recordToFile, let file { try? file.write(from: work) }
             // Meter the post-EQ, post-gain signal so LEDs reflect EQ and record level.
-            spectrum.ingest(workABL, frames: frames)
+            spectrum.ingest(workABL, frames: frames, gain: gain)
             scope.ingest(workABL, frames: frames)
+            if gain != 1 { scaleBuffers(workABL, by: gain) }
+            if recordToFile { writer?.enqueue(workABL, frames: frames) }   // off-thread write
         }
     }
 
@@ -422,7 +471,6 @@ public final class ProcessTapRecorder {
         guard let captureFormat, let sink = captureSink else {
             throw CA.Error(status: -1, context: "Missing capture format / sink")
         }
-        let tapFormat = captureFormat
         let sourceGainLock = self.sourceGainLock
         let micGainLock = self.micGainLock
         // Mixing state (nil when tap-only): drain the mic ring and sum it into the tap feed.
@@ -437,8 +485,7 @@ public final class ProcessTapRecorder {
             AudioDeviceCreateIOProcIDWithBlock(&newProcID, aggregateID, nil) {
                 _, inInputData, _, _, _ in
                 let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
-                let inBuffer = AVAudioPCMBuffer(pcmFormat: tapFormat, bufferListNoCopy: inInputData, deallocator: nil)
-                let frames = Int(inBuffer?.frameLength ?? 0)
+                let frames = frameCount(input, channels: channels)   // no allocation on the RT thread
                 let sourceGain = sourceGainLock.withLock { $0 }
 
                 // Tap-only: scale the tap feed in place and hand it straight to the sink.
@@ -544,17 +591,29 @@ private func addInterleaved(into dst: UnsafeMutableAudioBufferListPointer,
     }
 }
 
-/// Largest absolute float sample across every buffer in the list.
+/// Frames-per-channel of an input buffer list, without allocating (interleaved = one
+/// packed buffer of `channels` channels; planar = one buffer per channel).
+private func frameCount(_ abl: UnsafeMutableAudioBufferListPointer, channels: Int) -> Int {
+    guard abl.count > 0 else { return 0 }
+    if abl.count == 1 {
+        let ch = Int(abl[0].mNumberChannels)
+        let per = max(1, ch)
+        return Int(abl[0].mDataByteSize) / (MemoryLayout<Float>.size * per)
+    }
+    return Int(abl[0].mDataByteSize) / MemoryLayout<Float>.size
+}
+
+/// Largest absolute float sample across every buffer in the list (vectorized, RT-safe).
 private func peakOf(_ abl: UnsafeMutableAudioBufferListPointer) -> Float {
     var peak: Float = 0
     for buffer in abl {
         guard let data = buffer.mData else { continue }
         let samples = data.assumingMemoryBound(to: Float.self)
-        let count = Int(buffer.mDataByteSize) / MemoryLayout<Float>.size
-        for i in 0..<count {
-            let magnitude = abs(samples[i])
-            if magnitude > peak { peak = magnitude }
-        }
+        let count = vDSP_Length(Int(buffer.mDataByteSize) / MemoryLayout<Float>.size)
+        guard count > 0 else { continue }
+        var m: Float = 0
+        vDSP_maxmgv(samples, 1, &m, count)   // max magnitude
+        if m > peak { peak = m }
     }
     return peak
 }

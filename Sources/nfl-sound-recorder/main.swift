@@ -43,10 +43,10 @@ func printUsage() {
       --no-route        Record only — a tap-only aggregate, no output device, nothing
                         plays out (null sink). Overrides --out.
       --file <path>     Output file path (default: ./recording-<timestamp>.<ext>).
-      --format <fmt>    Recording format: caf, wav, aiff, aac, alac, flac (default: caf).
-                        caf/wav/aiff/alac/flac are lossless; aac is lossy (small files).
-                        If omitted but --file has a known extension, the format is
-                        inferred from it. macOS has no MP3 encoder — use aac instead.
+      --format <fmt>    Recording format: caf, wav, aiff, aac, alac, flac (default: aac).
+                        aac is lossy (~1 MB/min, the small default); caf/wav/aiff/alac/flac
+                        are lossless (caf ~90 MB/min). If omitted but --file has a known
+                        extension, the format is inferred. macOS has no MP3 encoder — use aac.
       --mute            Silence the app's normal output so only the routed copy is heard.
       --eq <g0,..,g9>   Enable the 10-band EQ with per-band gains in dB, low→high
                         (32,64,125,250,500,1k,2k,4k,8k,16k Hz). e.g. --eq 6,4,0,0,0,0,0,3,5,5
@@ -63,11 +63,17 @@ func printUsage() {
 // MARK: - Listing
 
 func listEverything() {
-    print("Running apps with audio-capable processes:")
-    let apps = AudioProcesses.list()
-    for app in apps {
+    let catalog = AudioProcesses.catalog()
+    print("Applications (helpers folded in — --app taps the whole group):")
+    for app in catalog.apps {
         let state = app.isPlaying ? "playing" : "idle"
-        print("  pid \(String(app.pid).padding(toLength: 6, withPad: " ", startingAt: 0))  \(app.name)  [\(app.bundleID)]  \(state)")
+        let pids = app.tapPIDs.map(String.init).joined(separator: ",")
+        print("  \(app.name)  [\(app.bundleID)]  \(state)  pids: \(pids)")
+    }
+    print("\nSystem audio processes (no owning app — target with --pid):")
+    for daemon in catalog.daemons {
+        let state = daemon.isPlaying ? "playing" : "idle"
+        print("  pid \(String(daemon.pid).padding(toLength: 6, withPad: " ", startingAt: 0))  \(daemon.name)  [\(daemon.bundleID)]  \(state)")
     }
 
     print("\nOutput devices:")
@@ -99,10 +105,10 @@ func resolveTarget() -> ProcessTapRecorder.Target? {
     if hasFlag("--system") { return .systemWide }
     if let pidStr = argValue("--pid"), let pid = pid_t(pidStr) { return .pid(pid) }
     if let bundle = argValue("--app") {
-        if let app = AudioProcesses.bestMatch(bundleID: bundle) {
-            return .pid(app.pid)
+        if let app = AudioProcesses.app(matching: bundle) {
+            return .pids(app.tapPIDs)
         }
-        FileHandle.standardError.write("No audio-capable process with bundle id \(bundle). Start playback and run --list again.\n".data(using: .utf8)!)
+        FileHandle.standardError.write("No running application with bundle id \(bundle). Check --list.\n".data(using: .utf8)!)
         return nil
     }
     return nil
@@ -201,6 +207,9 @@ func runSpectrumSelfTest() {
 
     // (frequency, amplitude, dBFS label) — sweep levels to mimic real, quieter audio.
     let cases: [(Double, Double, String)] = [
+        // 1007.8125 Hz is bin 43 exactly (48 kHz / 2048), so it carries no scalloping
+        // loss — that's the tone the meter's calibration is trimmed against.
+        (1007.8125, 0.5, "-6 dBFS (on-bin)"),
         (1000, 1.0, "0 dBFS"), (1000, 0.1, "-20 dBFS"), (1000, 0.01, "-40 dBFS"),
         (100, 0.3, "-10 dBFS"), (8000, 0.3, "-10 dBFS"),
     ]
@@ -215,12 +224,26 @@ func runSpectrumSelfTest() {
         for _ in 0..<4 { meter.ingest(abl, frames: frames) } // let smoothing settle
         let levels = meter.levels()
         meter.reset()
+        // Invert the meter's own mapping so the read-out is in dBFS: the band carrying
+        // the tone should land within a dB or two of the tone's own level, which is what
+        // makes the LEDs usable as record-level feedback rather than a light show.
+        let span = SpectrumMeter.ceilingDB - SpectrumMeter.floorDB
         print("\n\(Int(freq)) Hz @ \(label):")
         for (i, l) in levels.enumerated() where l > 0.01 {
             let bar = String(repeating: "█", count: Int(l * 30))
-            print("  \(labels[i].padding(toLength: 4, withPad: " ", startingAt: 0)) \(String(format: "%.3f", l)) \(bar)")
+            let db = SpectrumMeter.floorDB + l * span
+            print("  \(labels[i].padding(toLength: 4, withPad: " ", startingAt: 0)) "
+                  + "\(String(format: "%.3f", l)) \(String(format: "%6.1f dBFS", db)) \(bar)")
         }
     }
+
+    // Silence must read as *exactly* zero on every band, or the bottom LED of each
+    // column stays lit for the life of the recording and the meter always looks busy.
+    for i in 0..<frames { data[i * 2] = 0; data[i * 2 + 1] = 0 }
+    for _ in 0..<200 { meter.ingest(abl, frames: frames) }
+    let quiet = meter.levels()
+    let allZero = quiet.allSatisfy { $0 == 0 }
+    print("\nSilence decays to zero: \(allZero ? "✓ PASS" : "✗ FAIL — \(quiet)")")
 }
 
 // MARK: - Diagnostics helpers
@@ -274,13 +297,14 @@ let tapTarget = resolveTarget()
 
 func targetLabel(_ t: ProcessTapRecorder.Target) -> String {
     switch t {
-    case .pid(let pid): return "pid \(pid)"
-    case .systemWide:   return "system audio"
+    case .pid(let pid):   return "pid \(pid)"
+    case .pids(let pids): return "pids \(pids.map(String.init).joined(separator: ","))"
+    case .systemWide:     return "system audio"
     }
 }
 
 // Resolve format: explicit --format wins; otherwise infer from --file's extension;
-// otherwise default to CAF. An unknown --format value is a hard error.
+// otherwise default to AAC (small files). An unknown --format value is a hard error.
 let format: RecordingFormat = {
     if let raw = argValue("--format") {
         guard let f = RecordingFormat(rawValue: raw.lowercased()) else {
@@ -294,7 +318,7 @@ let format: RecordingFormat = {
        let inferred = RecordingFormat(fileExtension: (path as NSString).pathExtension) {
         return inferred
     }
-    return .caf
+    return .aac
 }()
 
 let fileURL: URL = {
