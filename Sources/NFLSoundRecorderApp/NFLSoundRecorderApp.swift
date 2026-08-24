@@ -16,7 +16,7 @@ struct NFLSoundRecorderApp: App {
             // Its own view observing MeterState: reading the reel angle/level here in the
             // Scene body would re-evaluate the whole scene — and rebuild MenuContentView —
             // 30 times a second while recording.
-            MenuBarLabel(meters: controller.meters, isRecording: controller.isRecording)
+            MenuBarLabel(isRecording: controller.isRecording)
         }
         .menuBarExtraStyle(.window)
 
@@ -33,16 +33,16 @@ struct NFLSoundRecorderApp: App {
     }
 }
 
-/// The menu-bar cassette, rasterized to a template image — MenuBarExtra renders an
-/// Image reliably, but not an arbitrary SwiftUI shape view (comes up blank).
+/// The menu-bar indicator. Use a native SF Symbol here: MenuBarExtra reliably lays
+/// out system images, while the custom rasterized cassette can produce an empty
+/// status-item label on current macOS builds.
 struct MenuBarLabel: View {
-    @ObservedObject var meters: MeterState
     let isRecording: Bool
 
     var body: some View {
-        Image(nsImage: MenuBarIconRenderer.image(isRecording: isRecording,
-                                                 angle: meters.iconAngle,
-                                                 level: meters.iconLevel))
+        Image(systemName: isRecording ? "record.circle.fill" : "waveform")
+            .imageScale(.medium)
+            .accessibilityLabel("TapDeck")
     }
 }
 
