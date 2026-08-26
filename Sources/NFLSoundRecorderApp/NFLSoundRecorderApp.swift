@@ -4,6 +4,8 @@ import SoundRecorderKit
 
 @main
 struct NFLSoundRecorderApp: App {
+    // Catches a second launch of an already-running TapDeck — see `AppDelegate`.
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var controller = RecordingController()
 
     var body: some Scene {
@@ -37,12 +39,23 @@ struct NFLSoundRecorderApp: App {
 /// out system images, while the custom rasterized cassette can produce an empty
 /// status-item label on current macOS builds.
 struct MenuBarLabel: View {
+    @Environment(\.openWindow) private var openWindow
     let isRecording: Bool
 
     var body: some View {
         Image(systemName: isRecording ? "record.circle.fill" : "waveform")
             .imageScale(.medium)
             .accessibilityLabel("TapDeck")
+            // The popover's content is built lazily, so the label is the only view
+            // guaranteed to exist — which makes it the one place a relaunch can reach
+            // `openWindow` from.
+            .onReceive(NotificationCenter.default.publisher(for: .tapDeckShowPanel)) { _ in
+                openWindow(id: "panel")
+                NSApp.activate(ignoringOtherApps: true)
+                // Hand off exactly like the tear-off button, so a relaunch while the
+                // popover happens to be open doesn't leave both panels on screen.
+                DispatchQueue.main.async { dismissMenuBarPopover() }
+            }
     }
 }
 
@@ -89,6 +102,35 @@ func dismissMenuBarPopover() {
     where String(describing: type(of: window)).contains("MenuBarExtra") {
         window.close()
     }
+}
+
+/// Handles launching TapDeck when it's *already* running.
+///
+/// TapDeck is an `LSUIElement` accessory: no Dock tile, no main window. Launching it
+/// again doesn't start a second process — LaunchServices finds the running one and
+/// re-activates it, and re-activating an accessory app has nothing to put on screen.
+/// The launch looks like it silently failed, leaving no way to tell a running TapDeck
+/// from a dead one short of hunting the menu bar for the icon. Put the panel up instead.
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        NotificationCenter.default.post(name: .tapDeckShowPanel, object: nil)
+        return true
+    }
+}
+
+extension Notification.Name {
+    /// A relaunch asked for the panel — posted by `AppDelegate`, handled in `MenuBarLabel`.
+    ///
+    /// This deliberately shows the tear-off window rather than the menu-bar popover.
+    /// SwiftUI never vends the `MenuBarExtra`'s `NSStatusItem`, and driving it by
+    /// clicking the underlying `NSStatusBarButton` only works while SwiftUI has yet to
+    /// build the popover window: once that window exists, SwiftUI still counts it as
+    /// presented after the popover has been dismissed, so a synthetic click toggles it
+    /// *shut* rather than open (measured 1 of 5 relaunches showing it, whether the click
+    /// was immediate or deferred a runloop turn). `openWindow` is public API and
+    /// deterministic — and unlike a popover, which vanishes the moment focus moves, the
+    /// window stays up long enough to actually use.
+    static let tapDeckShowPanel = Notification.Name("TapDeckShowPanel")
 }
 
 /// Reports the natural height of the popover content so it can hug-or-scroll.
