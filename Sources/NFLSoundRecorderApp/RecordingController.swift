@@ -171,10 +171,16 @@ final class RecordingController: ObservableObject {
                                   inputs: [AudioDeviceInfo], catalog: AudioSourceCatalog) {
         if let outputs {
             devices = outputs
-            // Keep an explicit "record only" choice; otherwise fall back to a real device.
-            if selectedDeviceUID.isEmpty
-                || (selectedDeviceUID != Self.noRouteUID
-                    && !outputs.contains(where: { $0.uid == selectedDeviceUID })) {
+            // First launch: default to "record only". Routing to whatever's already the
+            // system default output would play a second, latency-shifted copy of audio
+            // that's already audible through that same device — an instant, unavoidable
+            // echo for anything already playing out loud (e.g. a live Zoom/Meet call).
+            if selectedDeviceUID.isEmpty {
+                selectedDeviceUID = Self.noRouteUID
+            } else if selectedDeviceUID != Self.noRouteUID
+                        && !outputs.contains(where: { $0.uid == selectedDeviceUID }) {
+                // A previously-chosen device disappeared (unplugged, etc.) — best-effort
+                // fall back to a real device rather than silently going route-less.
                 selectedDeviceUID = outputs.first(where: { $0.id == defaultOut })?.uid
                     ?? outputs.first?.uid ?? ""
             }
