@@ -10,12 +10,13 @@ import os
 ///
 /// Architecture:
 ///   1. When a tap is involved, create a process tap (`AudioHardwareCreateProcessTap`)
-///      and a private aggregate device around it; one IOProc on that aggregate clocks
-///      the recording and hands us the captured frames.
+///      and a private aggregate device around it; its IOProc supplies app audio and
+///      clocks recording when no microphone is selected.
 ///   2. The microphone (when involved) is captured on its *own* device clock by
-///      `MicCapture`, resampled to the recording format, and bridged in via a ring
-///      buffer that the tap IOProc drains and sums — the input-side mirror of the
-///      routing ring. With **no tap** (mic-only), the mic's own IOProc clocks the file.
+///      `MicCapture`, resampled to the recording format, and used to clock mixed
+///      recordings. Tap audio arrives through a ring buffer, so an idle app cannot
+///      stop the microphone from reaching the file.
+///      With **no tap** (mic-only), the mic IOProc feeds the sink directly.
 ///   3. Every captured buffer — tap, mixed, or mic — flows through one shared sink that
 ///      applies the EQ, feeds the routing ring, applies the master record level, writes
 ///      the file, and updates the meters.
@@ -144,13 +145,9 @@ public final class ProcessTapRecorder: @unchecked Sendable {
     /// The live routing pipeline, or `nil` when recording only. Rebuilt on device change.
     private var monitor: AudioMonitor?
 
-    /// Microphone capture (when mixing or mic-only), the ring it feeds when mixing, and
-    /// scratch buffers for combining the mic with the tap.
+    /// The microphone clocks mixed recordings; the tap feeds the mixer's ring.
     private var micCapture: MicCapture?
-    private var micRing: AudioRingBuffer?
-    private var mixBuffer: AVAudioPCMBuffer?
-    private var micReadScratch: UnsafeMutablePointer<Float>?
-    private var micReadCapacity = 0
+    private var microphoneMixer: MicrophoneDrivenMixer?
 
     /// One shared sink for every captured buffer (tap / mixed / mic). Built once on start
     /// with captured locals so the real-time blocks never touch `self`.
@@ -177,23 +174,22 @@ public final class ProcessTapRecorder: @unchecked Sendable {
         self.warmupSeconds = max(0, warmupSeconds)
     }
 
-    deinit { freeMixScratch() }
-
     // MARK: Lifecycle
 
     public func start() throws {
         do {
             if let target = source.tapTarget {
-                // Tap (or tap+mic mix): the tap aggregate clocks the recording.
+                // Tap-only uses the aggregate clock; mixed recording uses the mic clock.
                 try createTap(target: target)
                 try createAggregateDevice()
                 try openOutputFile()
                 makeCaptureSink()
-                // Bring up mic capture BEFORE installing the tap IOProc, so the proc is
-                // built once already draining the mic ring (no reinstall/gap).
-                if let mic = source.micDevice { try startMicMixing(device: mic) }
+                if source.micDevice != nil, let captureFormat, let captureSink {
+                    microphoneMixer = try MicrophoneDrivenMixer(format: captureFormat, onBuffer: captureSink)
+                }
                 try installTapIOProc()
                 try CA.check(AudioDeviceStart(aggregateID, ioProcID), "AudioDeviceStart")
+                if let mic = source.micDevice { try startMicMixing(device: mic) }
                 startMonitor(device: routingDevice)
             } else if let mic = source.micDevice {
                 // Mic-only: the microphone's own IOProc clocks the recording.
@@ -254,9 +250,8 @@ public final class ProcessTapRecorder: @unchecked Sendable {
         tapID = 0
         ioProcID = nil
         ring = nil
-        micRing = nil
+        microphoneMixer = nil
         captureSink = nil
-        freeMixScratch()
     }
 
     // MARK: Live routing
@@ -472,12 +467,7 @@ public final class ProcessTapRecorder: @unchecked Sendable {
             throw CA.Error(status: -1, context: "Missing capture format / sink")
         }
         let sourceGainLock = self.sourceGainLock
-        let micGainLock = self.micGainLock
-        // Mixing state (nil when tap-only): drain the mic ring and sum it into the tap feed.
-        let micRing = self.micRing
-        let mixBuffer = self.mixBuffer
-        let micReadScratch = self.micReadScratch
-        let micReadCapacity = self.micReadCapacity
+        let mixer = microphoneMixer
         let channels = Int(captureFormat.channelCount)
 
         var newProcID: AudioDeviceIOProcID?
@@ -486,28 +476,13 @@ public final class ProcessTapRecorder: @unchecked Sendable {
                 _, inInputData, _, _, _ in
                 let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
                 let frames = frameCount(input, channels: channels)   // no allocation on the RT thread
-                let sourceGain = sourceGainLock.withLock { $0 }
-
-                // Tap-only: scale the tap feed in place and hand it straight to the sink.
-                guard let micRing, let mixBuffer, let micReadScratch else {
+                if let mixer {
+                    mixer.receiveTap(input, frames: frames)
+                } else {
+                    let sourceGain = sourceGainLock.withLock { $0 }
                     if sourceGain != 1 { scaleBuffers(input, by: sourceGain) }
                     sink(input, frames)
-                    return
                 }
-
-                // Mix: tap (×sourceGain) + mic (×micGain) → mixBuffer → sink.
-                let micGain = micGainLock.withLock { $0 }
-                mixBuffer.frameLength = AVAudioFrameCount(frames)
-                let mixABL = UnsafeMutableAudioBufferListPointer(mixBuffer.mutableAudioBufferList)
-                copyBuffers(from: input, to: mixABL)
-                if sourceGain != 1 { scaleBuffers(mixABL, by: sourceGain) }
-                let wanted = min(frames, micReadCapacity)
-                let got = micRing.read(into: micReadScratch, frames: wanted)
-                if got > 0 {
-                    addInterleaved(into: mixABL, from: micReadScratch, frames: got,
-                                   channels: channels, gain: micGain)
-                }
-                sink(mixABL, frames)
             },
             "AudioDeviceCreateIOProcIDWithBlock"
         )
@@ -516,23 +491,17 @@ public final class ProcessTapRecorder: @unchecked Sendable {
 
     // MARK: Microphone
 
-    /// Bring up mic capture that feeds the mix ring the tap IOProc drains. Non-fatal on
-    /// failure: the tap keeps recording, just without the mic.
+    /// Start the microphone after the tap producer is installed. Every mic callback
+    /// advances recording and metering even while the selected app produces no audio.
     private func startMicMixing(device: AudioDeviceInfo) throws {
-        guard let captureFormat else { return }
-        let channels = Int(captureFormat.channelCount)
-        // ~0.5 s of slack between the mic clock and the tap clock.
-        let ring = AudioRingBuffer(channels: channels,
-                                   capacityFrames: Int(captureFormat.sampleRate * 0.5))
-        micRing = ring
-        mixBuffer = AVAudioPCMBuffer(pcmFormat: captureFormat, frameCapacity: 16_384)
-        micReadCapacity = 16_384
-        micReadScratch = .allocate(capacity: channels * micReadCapacity)
-        micReadScratch?.initialize(repeating: 0, count: channels * micReadCapacity)
-
+        guard let captureFormat, let mixer = microphoneMixer else { return }
+        let micGainLock = self.micGainLock
+        let sourceGainLock = self.sourceGainLock
         let mic = MicCapture(device: device, targetRate: captureFormat.sampleRate,
-                             targetChannels: channels) { abl, frames in
-            ring.write(abl, frames: frames)
+                             targetChannels: Int(captureFormat.channelCount)) { abl, frames in
+            mixer.receiveMicrophone(abl, frames: frames,
+                                    microphoneGain: micGainLock.withLock { $0 },
+                                    sourceGain: sourceGainLock.withLock { $0 })
         }
         try mic.start()
         micCapture = mic
@@ -555,13 +524,6 @@ public final class ProcessTapRecorder: @unchecked Sendable {
         try mic.start()
         micCapture = mic
     }
-
-    private func freeMixScratch() {
-        micReadScratch?.deallocate()
-        micReadScratch = nil
-        micReadCapacity = 0
-        mixBuffer = nil
-    }
 }
 
 /// Multiply every sample in the buffer list by a scalar gain, in place.
@@ -571,23 +533,6 @@ private func scaleBuffers(_ abl: UnsafeMutableAudioBufferListPointer, by gain: F
         guard let data = buffer.mData else { continue }
         let p = data.assumingMemoryBound(to: Float.self)
         vDSP_vsmul(p, 1, &g, p, 1, vDSP_Length(Int(buffer.mDataByteSize) / MemoryLayout<Float>.size))
-    }
-}
-
-/// Add `frames` of interleaved source samples (×gain) into an interleaved destination
-/// buffer list of the same channel count. Used to sum the mic feed into the tap feed.
-private func addInterleaved(into dst: UnsafeMutableAudioBufferListPointer,
-                            from src: UnsafeMutablePointer<Float>, frames: Int,
-                            channels: Int, gain: Float) {
-    guard dst.count == 1, let data = dst[0].mData else { return }
-    let out = data.assumingMemoryBound(to: Float.self)
-    let n = min(frames * channels, Int(dst[0].mDataByteSize) / MemoryLayout<Float>.size)
-    if gain == 1 {
-        vDSP_vadd(out, 1, src, 1, out, 1, vDSP_Length(n))
-    } else {
-        var g = gain
-        // out = out + src * gain
-        vDSP_vsma(src, 1, &g, out, 1, out, 1, vDSP_Length(n))
     }
 }
 
@@ -616,19 +561,4 @@ private func peakOf(_ abl: UnsafeMutableAudioBufferListPointer) -> Float {
         if m > peak { peak = m }
     }
     return peak
-}
-
-/// memcpy each buffer of one list into the matching buffer of another, clamping to
-/// the smaller size and zero-filling any remaining output space.
-private func copyBuffers(from src: UnsafeMutableAudioBufferListPointer,
-                         to dst: UnsafeMutableAudioBufferListPointer) {
-    let pairs = min(src.count, dst.count)
-    for i in 0..<pairs {
-        guard let srcData = src[i].mData, let dstData = dst[i].mData else { continue }
-        let byteCount = min(Int(src[i].mDataByteSize), Int(dst[i].mDataByteSize))
-        memcpy(dstData, srcData, byteCount)
-        if Int(dst[i].mDataByteSize) > byteCount {
-            memset(dstData + byteCount, 0, Int(dst[i].mDataByteSize) - byteCount)
-        }
-    }
 }

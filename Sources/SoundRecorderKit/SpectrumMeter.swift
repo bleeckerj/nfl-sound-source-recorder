@@ -83,9 +83,9 @@ public final class SpectrumMeter: @unchecked Sendable {
 
     public func ingest(_ abl: UnsafeMutableAudioBufferListPointer, frames: Int,
                        gain: Float = 1) {
-        guard frames > 0, let buffer = abl.first, let data = buffer.mData else { return }
-        let channels = max(1, Int(buffer.mNumberChannels))
-        let src = data.assumingMemoryBound(to: Float.self)
+        guard frames > 0 else { return }
+        let channels = abl.reduce(0) { $0 + Int($1.mNumberChannels) }
+        guard channels > 0 else { return }
         let meterGain = gain.isFinite ? max(0, gain) : 1
 
         // Slide the newest samples into a rolling mono window.
@@ -93,10 +93,20 @@ public final class SpectrumMeter: @unchecked Sendable {
         let keep = n - take
         if keep > 0 { memmove(mono, mono + take, keep * MemoryLayout<Float>.size) }
         let startFrame = frames - take
-        for i in 0..<take {
-            let idx = (startFrame + i) * channels
-            let sample = channels >= 2 ? (src[idx] + src[idx + 1]) * 0.5 : src[idx]
-            mono[keep + i] = sample * meterGain
+        for i in 0..<take { mono[keep + i] = 0 }
+        // Average every channel regardless of how HAL groups the buffers. A mic
+        // on input 2 must meter the same in planar and interleaved audio.
+        for buffer in abl {
+            let bufferChannels = Int(buffer.mNumberChannels)
+            guard bufferChannels > 0, let data = buffer.mData else { continue }
+            let src = data.assumingMemoryBound(to: Float.self)
+            let available = Int(buffer.mDataByteSize) / (MemoryLayout<Float>.size * bufferChannels)
+            for i in 0..<take where startFrame + i < available {
+                let base = (startFrame + i) * bufferChannels
+                var sum: Float = 0
+                for channel in 0..<bufferChannels { sum += src[base + channel] }
+                mono[keep + i] += sum * meterGain / Float(channels)
+            }
         }
         analyze()
     }

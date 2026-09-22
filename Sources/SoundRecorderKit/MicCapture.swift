@@ -11,7 +11,7 @@ import os
 /// It is the input-side mirror of `AudioMonitor`: where the monitor pulls the ring on
 /// the *output* device's clock, this pushes on the *input* device's clock. Two ways it
 /// is used by `ProcessTapRecorder`:
-///   • mixing — target = the tap format; `onBuffer` writes into a ring the tap IOProc drains.
+///   • mixing — target = the tap format; `onBuffer` clocks the mixer and recording.
 ///   • mic-only — target = the mic's own format (identity resample); `onBuffer` is the
 ///     recorder's `processCaptured`, so the mic IOProc itself clocks the file.
 final class MicCapture {

@@ -31,5 +31,9 @@ let package = Package(
             dependencies: ["SoundRecorderKit"],
             path: "Sources/NFLSoundRecorderMCP"
         ),
+        .testTarget(
+            name: "SoundRecorderKitTests",
+            dependencies: ["SoundRecorderKit"]
+        ),
     ]
 )
