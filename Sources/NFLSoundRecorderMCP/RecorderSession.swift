@@ -12,7 +12,7 @@ final class RecorderSession {
     }
 
     private(set) var active: Active?
-    var isRecording: Bool { active != nil }
+    var isRecording: Bool { active != nil && active?.recorder.recordingError == nil }
     private(set) var isPaused = false
 
     private var pausedAt: Date?
@@ -28,6 +28,7 @@ final class RecorderSession {
                mute: Bool,
                driftCompensation: Bool,
                warmupSeconds: Double,
+               speakerMode: Bool,
                sourceLevelDB: Double?,
                micLevelDB: Double?,
                format: RecordingFormat,
@@ -35,7 +36,7 @@ final class RecorderSession {
         if active != nil { throw SessionError("Already recording. Call stop_recording first.") }
         let recorder = ProcessTapRecorder(source: source, outputDevice: device, fileURL: fileURL,
                                           format: format, mute: mute, driftCompensation: driftCompensation,
-                                          warmupSeconds: warmupSeconds)
+                                          warmupSeconds: warmupSeconds, speakerMode: speakerMode)
         try recorder.start()
         recorder.equalizer.setGains(eqGains)
         recorder.equalizer.setEnabled(eqEnabled)
@@ -77,6 +78,9 @@ final class RecorderSession {
 
     /// Reroute the live monitor without interrupting capture. Passing nil disables routing.
     func setRoutingDevice(_ device: AudioDeviceInfo?) throws {
+        if active?.recorder.isSpeakerMode == true, device != nil {
+            throw SessionError("Speaker mode requires record-only routing.")
+        }
         guard let active else { throw SessionError("Not currently recording.") }
         active.recorder.setRoutingDevice(device)
         self.active?.deviceName = device?.name ?? "(record only)"
@@ -97,7 +101,7 @@ final class RecorderSession {
 
     /// Stops the recording and returns the file URL and its duration in seconds.
     @discardableResult
-    func stop() -> (url: URL, duration: TimeInterval)? {
+    func stop() -> (url: URL, duration: TimeInterval, error: String?, sources: URL?)? {
         guard let active else { return nil }
         active.recorder.stop()
         let duration = elapsed ?? Date().timeIntervalSince(active.startDate)
@@ -105,7 +109,7 @@ final class RecorderSession {
         isPaused = false
         pausedAt = nil
         pausedTotal = 0
-        return (active.fileURL, duration)
+        return (active.fileURL, duration, active.recorder.recordingError, active.recorder.sourceFilesURL)
     }
 
     struct SessionError: LocalizedError, CustomStringConvertible {

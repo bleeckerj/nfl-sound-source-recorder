@@ -1,0 +1,5 @@
+Vendor/WebRTCAudio/webrtc/** linguist-vendored -whitespace
+Vendor/WebRTCAudio/absl/** linguist-vendored -whitespace
+Vendor/WebRTCAudio/Licenses/** -whitespace
+Vendor/WebRTCAudio/Abseil-LICENSE -whitespace
+Vendor/WebRTCAudio/WebRTC-AUTHORS -whitespace

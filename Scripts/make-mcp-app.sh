@@ -12,6 +12,12 @@
 set -euo pipefail
 
 CONFIG="release"
+for argument in "$@"; do
+    case "$argument" in
+        --debug) CONFIG="debug" ;;
+        *) echo "Unknown option: $argument" >&2; exit 1 ;;
+    esac
+done
 APP_NAME="TapDeck MCP"
 BUNDLE_ID="com.nfl.tapdeck.mcp"
 EXECUTABLE="nfl-sound-recorder-mcp"
@@ -27,6 +33,7 @@ echo "▸ Assembling bundle…"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS"
 cp "$BUILD_DIR/$EXECUTABLE" "$APP_DIR/Contents/MacOS/$EXECUTABLE"
+bash "$ROOT/Scripts/copy-third-party-licenses.sh" "$APP_DIR/Contents/Resources"
 
 cat > "$APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>

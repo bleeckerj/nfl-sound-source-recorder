@@ -35,6 +35,13 @@ final class AsyncAudioFileWriter {
     private var writeIndex = 0
     private var availableFrames = 0
     private var droppedTotal: UInt64 = 0
+    private let errorState = OSAllocatedUnfairLock(initialState: Optional<String>.none)
+
+    var failure: String? {
+        if let error = errorState.withLock({ $0 }) { return error }
+        lock.lock(); let dropped = droppedTotal; lock.unlock()
+        return dropped > 0 ? "Audio writer overflow: dropped \(dropped) frames" : nil
+    }
 
     /// Frames the ring dropped because the writer couldn't keep up (should stay 0).
     private(set) var droppedFrames: UInt64 = 0
@@ -133,6 +140,7 @@ final class AsyncAudioFileWriter {
             do {
                 try file.write(from: drainBuffer)
             } catch {
+                errorState.withLock { if $0 == nil { $0 = error.localizedDescription } }
                 log.error("AVAudioFile.write failed: \(error.localizedDescription)")
             }
         }

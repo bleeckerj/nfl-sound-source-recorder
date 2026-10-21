@@ -15,6 +15,14 @@
 set -euo pipefail
 
 CONFIG="release"
+INSTALL="${INSTALL:-1}"
+for argument in "$@"; do
+    case "$argument" in
+        --debug) CONFIG="debug" ;;
+        --no-install) INSTALL="0" ;;
+        *) echo "Unknown option: $argument" >&2; exit 1 ;;
+    esac
+done
 APP_NAME="TapDeck"
 BUNDLE_ID="com.nfl.tapdeck"
 EXECUTABLE="NFLSoundRecorderApp"
@@ -30,6 +38,7 @@ echo "▸ Assembling bundle…"
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$BUILD_DIR/$EXECUTABLE" "$APP_DIR/Contents/MacOS/$EXECUTABLE"
+bash "$ROOT/Scripts/copy-third-party-licenses.sh" "$APP_DIR/Contents/Resources"
 
 # App icon — the skeuomorphic cassette. Rebuild it if missing so a fresh clone
 # still gets an icon without a separate step.
@@ -86,7 +95,6 @@ codesign --verify --strict --verbose=2 "$APP_DIR"
 # Install a copy to /Applications so the latest build is readily launchable for testing.
 # Skip with INSTALL=0. Quits any running instance first so the bundle can be replaced
 # cleanly (a running app holds its bundle open).
-INSTALL="${INSTALL:-1}"
 INSTALL_DIR="/Applications/$APP_NAME.app"
 if [ "$INSTALL" = "1" ]; then
     echo "▸ Installing to $INSTALL_DIR (local testing copy)…"

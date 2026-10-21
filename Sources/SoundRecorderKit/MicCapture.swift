@@ -24,6 +24,7 @@ final class MicCapture {
     private let targetRate: Double
     private let targetChannels: Int
     private let onBuffer: BufferHandler
+    private let timestampHandler: ((UnsafeMutableAudioBufferListPointer, Int, AudioTimeStamp) -> Void)?
 
     private var deviceID: AudioObjectID = 0
     private var procID: AudioDeviceIOProcID?
@@ -34,11 +35,13 @@ final class MicCapture {
     ///   - targetChannels: channel count to deliver (the tap channel count when mixing).
     ///   - onBuffer: receives interleaved Float32 frames at the target format.
     init(device: AudioDeviceInfo, targetRate: Double, targetChannels: Int,
+         timestampHandler: ((UnsafeMutableAudioBufferListPointer, Int, AudioTimeStamp) -> Void)? = nil,
          onBuffer: @escaping BufferHandler) {
         self.device = device
         self.targetRate = targetRate
         self.targetChannels = max(1, targetChannels)
         self.onBuffer = onBuffer
+        self.timestampHandler = timestampHandler
     }
 
     deinit { stop() }
@@ -57,6 +60,7 @@ final class MicCapture {
 
         let targetChannels = self.targetChannels
         let onBuffer = self.onBuffer
+        let timestampHandler = self.timestampHandler
         let state = MicResampleState(channels: targetChannels)
         // Output scratch: generously sized for one input cycle upsampled to the target rate.
         let outCapacity = 32_768
@@ -67,7 +71,7 @@ final class MicCapture {
         var newProc: AudioDeviceIOProcID?
         try CA.check(
             AudioDeviceCreateIOProcIDWithBlock(&newProc, id, nil) {
-                _, inInputData, _, _, _ in
+                _, inInputData, inputTime, _, _ in
                 let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
                 let (inputFrames, inCh, interleaved) = micLayout(input)
                 guard inputFrames > 0, inCh > 0 else { return }
@@ -89,6 +93,7 @@ final class MicCapture {
 
                 // Produce output frames while both interpolation neighbours are in range.
                 var frac = state.frac
+                let initialFraction = frac
                 var produced = 0
                 while frac <= Double(inputFrames - 1) && produced < outCapacity {
                     let idx = Int(frac.rounded(.down))
@@ -115,14 +120,25 @@ final class MicCapture {
                     )
                 )
                 withUnsafeMutablePointer(to: &abl) { p in
-                    onBuffer(UnsafeMutableAudioBufferListPointer(p), produced)
+                    let buffers = UnsafeMutableAudioBufferListPointer(p)
+                    if let timestampHandler {
+                        var timestamp = inputTime.pointee
+                        if timestamp.mFlags.contains(.hostTimeValid) {
+                            let seconds = AVAudioTime.seconds(forHostTime: timestamp.mHostTime) + initialFraction / rate
+                            timestamp.mHostTime = AVAudioTime.hostTime(forSeconds: max(0, seconds))
+                        }
+                        timestampHandler(buffers, produced, timestamp)
+                    } else {
+                        onBuffer(buffers, produced)
+                    }
                 }
             },
             "AudioDeviceCreateIOProcIDWithBlock (mic)"
         )
-        try CA.check(AudioDeviceStart(id, newProc), "AudioDeviceStart (mic)")
         deviceID = id
         procID = newProc
+        do { try CA.check(AudioDeviceStart(id, newProc), "AudioDeviceStart (mic)") }
+        catch { stop(); throw error }
         log.info("Capturing mic \(id) at \(rate) Hz → \(self.targetRate) Hz (step \(step))")
     }
 

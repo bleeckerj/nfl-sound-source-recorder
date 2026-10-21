@@ -1,94 +1,116 @@
-# Speaker recording qualification
+# Speaker recording
 
-The native higher-quality speaker mode failed hardware qualification. It is not
-available in the TapDeck interface, normal CLI, or MCP interface yet.
+TapDeck has an explicit **Open speakers: echo cancellation** mode. It uses local
+WebRTC AEC3 processing with the captured app audio as the reference. Standard
+recording remains the default. This first version supports the built-in Mac
+microphone and speakers.
 
-The first milestone adds native VoiceProcessingIO capture and a separate,
-bounded diagnostic that saves raw and processed microphone audio. The existing
-recording paths and user interface are unchanged.
+## Use
 
-## Local evidence, October 20, 2026
+In the app, select the call app under Record and enable Open speakers. Select the
+built-in microphone if it is not already selected. The switch sets Route to None
+and leaves the original app output audible. Routing controls stay disabled for
+this recording mode. Echo cancellation adapts during the first few seconds.
 
-- The MacBook Air microphone and speakers were the default devices, both at 48 kHz.
-- The first AVAudioEngine-based test failed during native output-unit initialization
-  with OSStatus -10875. Audio logs also reported aggregate-device input-channel
-  layout mismatches. No speech playback or microphone capture completed.
-- The replacement diagnostic uses VoiceProcessingIO directly with explicit device
-  selection, disabled automatic gain control, minimum fixed ducking, and silent
-  speaker output. It has not passed hardware qualification.
-- A subsequent run stalled in `AudioObjectGetPropertyData` while querying the default
-  input device, before reaching the replacement native implementation. A stack
-  sample confirmed the blocked Core Audio initialization. Only that diagnostic
-  process was terminated. A subsequent bounded system audio inventory was empty.
-- Two authenticated audio-service restarts restored device discovery. Attempts 3
-  and 4 rejected custom silent-output formats with OSStatus -10868; attempt 5
-  timed out during device discovery. The corrected implementation leaves the
-  render bus in its native format and only tears down initialized/running stages.
-- Attempt 6 reached direct VoiceProcessingIO initialization after a successful
-  restart and failed with OSStatus -10875. No capture or playback began. Both
-  AVAudioEngine and direct VoiceProcessingIO have now failed the initialization
-  gate on this Mac. Device discovery stalled again afterward.
-- A final authenticated cleanup restart restored device discovery. The bounded
-  device-only diagnostic resolved the MacBook Air microphone and speakers and
-  exited successfully. No further native capture attempts followed that check.
-- No acoustic suppression measurement, overlapping-speech assessment, Zoom
-  coexistence test, or long-duration test has passed. The 20 dB reduction target
-  remains unverified.
+CLI example:
 
-Test files are kept under
-`/Users/julian/Music/TapDeck/Speaker Mode Qualification/`.
-The CAF files from failed initialization contain no captured audio. They are
-failure evidence. Each test has a separate folder; failed runs are never reused.
+```sh
+"dist/TapDeck CLI.app/Contents/MacOS/nfl-sound-recorder" \
+  --system --mic-default --speaker-mode --file "$HOME/Music/TapDeck/meeting.m4a"
+```
 
-## Build and run
+MCP `start_recording` accepts `speaker_mode: true` with a call app or system
+source and `microphone: "default"` or the built-in microphone UID. Output defaults
+to record-only in this mode. Explicit routing or muting requests are rejected.
+Status and stop results include `speakerMode`, `sourceFiles`, and any error.
 
-Build the signed diagnostic without replacing the installed TapDeck app:
+For a mix named `meeting.m4a`, `meeting.sources/` contains:
+
+- `app-audio.caf`: direct stereo app audio at 48 kHz.
+- `microphone-raw.caf`: microphone audio before echo cancellation, mono at 48 kHz.
+- `microphone-cleaned.caf`: the processed microphone, mono at 48 kHz.
+- `session.json`: backend, format, source filenames, frame count, completion and errors.
+
+The mix uses direct app audio plus the cleaned microphone. Per-feed gains and EQ
+apply to the mix; source tracks retain their original levels. Source tracks use
+Float32 PCM, approximately 46 MB/min in total, in addition to the mix.
+
+## Timing and failure handling
+
+Device callbacks copy PCM into bounded, timestamped buffers. Both feeds are
+resampled onto a shared 48 kHz host-time timeline, correcting independent clock
+rates without allowing drift to accumulate. One worker processes 10 ms blocks
+with 40 ms of input buffering. The microphone advances the timeline when the app
+is silent. The processor continues adapting during warmup and pauses; all files
+share the same saving decision.
+
+A device change, missing microphone timeline, processing error or file-writer
+failure stops and finalizes the recording. The reason remains available to every
+front end and in the session JSON. The engine never substitutes raw app-plus-mic
+mixing after an echo-cancellation failure. Existing destinations are preserved.
+
+DSP code is optimized in debug builds as well as release builds. The initial
+unoptimized build could not sustain live processing and stopped with a timeline
+overrun.
+
+## Local qualification, October 20, 2026
+
+MacBook Air microphone and speakers, both at 48 kHz:
+
+- The optimized 20-second controlled speech capture completed successfully.
+- Each source track contains 919,200 frames; no writer frames were dropped.
+- After three seconds of convergence, the analyzer selected 9.88 seconds of speech.
+- Raw microphone RMS during those portions was -26.19 dBFS.
+- Cleaned microphone RMS was 23.05 dB lower, exceeding the 20 dB speaker-only target.
+- The synthetic delayed, speech-modulated echo test measured 33.35 dB reduction.
+  An independent signal added after convergence retained its level within 0.62 dB.
+- A continuous stationary-noise test measured 18.81 dB total RMS reduction.
+
+Evidence is stored in
+`/Users/julian/Music/TapDeck/Speaker Mode Qualification/2026-10-20-test-8/`.
+`acoustic-analysis.json` contains the measurement and criteria. Capture completion
+alone does not establish echo suppression. The acoustic measurement assumes
+controlled speaker-only playback in a quiet room.
+
+Actual overlapping speech in a Zoom call, Zoom coexistence and a 90-minute live
+soak have not been verified. The independent-signal test is an algorithm check.
+It does not establish live-call performance. External speakers, USB microphones
+and Bluetooth devices are outside this first version's supported setup.
+
+## Repeat the bounded check
+
+Build a signed diagnostic without replacing the installed app:
 
 ```sh
 bash Scripts/make-speaker-check-app.sh
 ```
 
-Inspect devices without starting capture:
-
-```sh
-"dist/TapDeck Speaker Check.app/Contents/MacOS/tapdeck-speaker-check" --devices
-```
-
-Use a fresh destination for every capture. For example:
+Use `--devices` to inspect defaults without capture. Use a fresh destination for
+capture; the diagnostic refuses existing audio or reports. For example:
 
 ```sh
 "dist/TapDeck Speaker Check.app/Contents/MacOS/tapdeck-speaker-check" \
   --directory "$HOME/Music/TapDeck/Speaker Mode Qualification/next-test" \
   --duration 30 --playback /absolute/path/to/clean-speech.aiff
+python3 Scripts/analyze-speaker-check.py \
+  "$HOME/Music/TapDeck/Speaker Mode Qualification/next-test" --write-report
 ```
 
-The diagnostic requires microphone permission and built-in default input/output.
-Playback starts after two seconds and is stopped when capture ends. Each phase
-has a watchdog; a stalled operation produces `failure.json` and exits. The command
-does not restart the system audio service or change system speaker volume.
+Playback starts after two seconds and stops with capture. Every phase has a
+watchdog. Stalls write `failure.json` and exit. The command does not restart the
+audio service or change system volume. The analyzer requires ffmpeg and a quiet
+speaker-only sample; overlapping local speech invalidates this RMS comparison.
 
-`qualification.json` reports capture completion, frame counts, dropped frames,
-device identities, and reported native latency. Capture completion alone does not
-establish that echo cancellation is effective. Compare the two source files using
-a known speech sample and listening tests before enabling a speaker recording UI.
+## Native backend history
 
-## Verification completed
+Apple's AVAudioEngine and direct VoiceProcessingIO implementations both failed
+initialization with OSStatus -10875 on this Mac. Custom native render formats
+were rejected with -10868, and subsequent device discovery sometimes stalled.
+Authenticated audio-service restarts restored discovery. Native attempts and
+failure evidence remain in test folders 1 through 6. They contain no successful
+acoustic capture. The user selected bundled WebRTC processing after these failures.
+Speaker mode never calls the native voice-processing implementation.
 
-- All seven Swift tests pass, including two qualification destination-preservation tests.
-- The Swift test build compiles the app, normal CLI, MCP, and diagnostic targets.
-- The diagnostic bundle builds and passes strict code-signature verification.
-- Help and invalid-duration checks exit without initializing audio or starting capture.
-- The device-discovery watchdog was exercised against the stalled audio query; it
-  exited with status 3 and a clear timeout after ten seconds.
-- The test folders contain `failure.json`; `2026-10-20-test-2` also contains
-  `blocked-thread.txt` from the stalled device query.
-
-## Remaining implementation
-
-- After an audio backend passes qualification, implement timestamp-aligned
-  app/raw/clean capture, the finished mix and retained source tracks, explicit
-  speaker-mode controls in the app/CLI/MCP, interruption handling, and the
-  acceptance tests in the approved plan.
-- A processing failure must finalize the mix and source files and display its
-  reason in the app, CLI, or MCP result. Raw app-plus-mic capture cannot replace
-  echo cancellation without an explicit change of recording mode.
+Test 7 exercised the unoptimized WebRTC build and saved 7.39 seconds before the
+worker overran. Its session JSON reports failure. Test 8 used optimized DSP code
+and passed capture and acoustic measurement.

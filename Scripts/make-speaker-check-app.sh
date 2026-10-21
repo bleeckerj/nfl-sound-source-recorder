@@ -8,6 +8,7 @@ cd "$ROOT"
 swift build --product tapdeck-speaker-check
 mkdir -p "$APP_DIR/Contents/MacOS"
 cp "$ROOT/.build/debug/tapdeck-speaker-check" "$APP_DIR/Contents/MacOS/"
+bash "$ROOT/Scripts/copy-third-party-licenses.sh" "$APP_DIR/Contents/Resources"
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -20,6 +21,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <key>CFBundleVersion</key><string>1</string>
 <key>LSMinimumSystemVersion</key><string>14.4</string>
 <key>LSUIElement</key><true/>
+<key>NSAudioCaptureUsageDescription</key><string>TapDeck captures the speaker test audio as an echo reference.</string>
 <key>NSMicrophoneUsageDescription</key>
 <string>TapDeck compares raw and echo-cancelled microphone audio in a short speaker qualification test.</string>
 </dict></plist>

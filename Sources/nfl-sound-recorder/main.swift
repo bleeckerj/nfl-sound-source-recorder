@@ -37,6 +37,9 @@ func printUsage() {
                         recording. Omit the tap flags (--app/--pid/--system) to record
                         the mic ALONE.
       --mic-default     Like --mic, using the system default input device.
+      --speaker-mode    Cancel speaker echo with local WebRTC processing. Requires app/
+                        system audio plus the built-in mic and speakers. Disables routing;
+                        keeps original source tracks beside the mix (~46 MB/min).
       --mic-level <dB>  Microphone feed level in dB (0 = unity, default 0). For balance.
       --source-level <dB> Tap/system feed level in dB (0 = unity, default 0). For balance.
       --out <deviceUID> Output device UID to route to (default: current default output).
@@ -131,6 +134,12 @@ func resolveMicDevice() throws -> AudioDeviceInfo? {
 }
 
 func resolveOutputDevice() throws -> AudioDeviceInfo? {
+    if hasFlag("--speaker-mode") {
+        guard argValue("--out") == nil, !hasFlag("--mute") else {
+            throw CLIError(message: "Speaker mode requires no --out and no --mute.")
+        }
+        return nil
+    }
     if hasFlag("--no-route") { return nil }   // record-only: tap-only aggregate
     let devices = try AudioSystem.outputDevices()
     if let wanted = argValue("--out") {
@@ -486,7 +495,8 @@ do {
     let warmup = argValue("--warmup").flatMap(Double.init) ?? 0.6
     let recorder = ProcessTapRecorder(source: source, outputDevice: device, fileURL: fileURL,
                                       format: format, mute: hasFlag("--mute"),
-                                      driftCompensation: hasFlag("--drift"), warmupSeconds: warmup)
+                                      driftCompensation: hasFlag("--drift"), warmupSeconds: warmup,
+                                      speakerMode: hasFlag("--speaker-mode"))
     if let lvl = argValue("--source-level").flatMap(Double.init) { recorder.setSourceGain(dB: lvl) }
     if let lvl = argValue("--mic-level").flatMap(Double.init) { recorder.setMicGain(dB: lvl) }
 
@@ -533,6 +543,11 @@ do {
         print("\n\nStopped. Saved: \(fileURL.path)")
         print("  frames captured: \(recorder.meter.totalFrames)")
         print("  peak level:      \(db)")
+        if let sources = recorder.sourceFilesURL { print("  source tracks:   \(sources.path)") }
+        if let error = recorder.recordingError {
+            FileHandle.standardError.write("Recording failed; partial files retained: \(error)\n".data(using: .utf8)!)
+            exit(1)
+        }
         print(maxPeak > 0 ? "  ✓ Signal captured." : "  ✗ No signal — see the causes above.")
         exit(0)
     }
@@ -560,6 +575,7 @@ do {
     let meterState = MeterState()
     let interval = 0.25
     let meterTimer = Timer(timeInterval: interval, repeats: true) { _ in
+        if recorder.recordingError != nil { finish() }
         let peak = recorder.meter.takePeak()
         let dbText = peak > 0 ? String(format: "%6.1f dBFS", LevelMeter.dBFS(peak)) : "  −∞ dBFS"
         FileHandle.standardError.write("\r  [\(meterBar(peak))] \(dbText)   ".data(using: .utf8)!)

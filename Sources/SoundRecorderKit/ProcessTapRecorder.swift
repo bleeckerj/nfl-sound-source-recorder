@@ -69,6 +69,20 @@ public final class ProcessTapRecorder: @unchecked Sendable {
     private let mute: Bool
     private let driftCompensation: Bool
     private let warmupSeconds: Double
+    private let speakerMode: Bool
+    public var isSpeakerMode: Bool { speakerMode }
+    private let lifecycleLock = NSRecursiveLock()
+    private var errorWatch: DispatchSourceTimer?
+    private var speakerPipeline: SpeakerRecordingPipeline?
+    private var speakerDeviceGuard: SpeakerDeviceGuard?
+    private let speakerSaveState = OSAllocatedUnfairLock(initialState: false)
+    private let finalError = OSAllocatedUnfairLock(initialState: Optional<String>.none)
+    public var recordingError: String? {
+        finalError.withLock { $0 }
+    }
+    public var sourceFilesURL: URL? {
+        speakerMode ? fileURL.deletingPathExtension().appendingPathExtension("sources") : nil
+    }
 
     /// 10-band EQ applied to both the routed output and the recorded file.
     /// Control it live (e.g. from the UI) via `setGain`/`setEnabled`.
@@ -164,32 +178,73 @@ public final class ProcessTapRecorder: @unchecked Sendable {
     ///     0 to keep the raw ramp.
     public init(source: Source, outputDevice: AudioDeviceInfo?, fileURL: URL,
                 format: RecordingFormat = .aac, mute: Bool,
-                driftCompensation: Bool = false, warmupSeconds: Double = 0.6) {
+                driftCompensation: Bool = false, warmupSeconds: Double = 0.6, speakerMode: Bool = false) {
         self.source = source
         self.routingDevice = outputDevice
         self.fileURL = fileURL
         self.format = format
         self.mute = mute
         self.driftCompensation = driftCompensation
-        self.warmupSeconds = max(0, warmupSeconds)
+        self.warmupSeconds = warmupSeconds.isFinite ? max(0, warmupSeconds) : 0.6
+        self.speakerMode = speakerMode
     }
 
     // MARK: Lifecycle
+    deinit { stop() }
 
     public func start() throws {
+        lifecycleLock.lock(); defer { lifecycleLock.unlock() }
         do {
+            if speakerMode {
+                for path in [fileURL, sourceFilesURL!] {
+                    guard !FileManager.default.fileExists(atPath: path.path) else {
+                        throw CA.Error(status: -1, context: "Speaker recording destination already exists: \(path.path)")
+                    }
+                }
+                guard case .mix(_, let mic) = source else {
+                    throw CA.Error(status: -1, context: "Speaker mode requires app or system audio plus a microphone")
+                }
+                try SpeakerRecordingPipeline.validate(microphone: mic, output: routingDevice, mute: mute)
+                speakerDeviceGuard = try SpeakerDeviceGuard(microphone: mic) { [finalError] message in
+                    finalError.withLock { if $0 == nil { $0 = message } }
+                }
+            }
             if let target = source.tapTarget {
                 // Tap-only uses the aggregate clock; mixed recording uses the mic clock.
                 try createTap(target: target)
+                let tapRate = captureFormat!.sampleRate
+                if speakerMode {
+                    let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                                               channels: 2, interleaved: true)!
+                    setCaptureFormat(format, description: "48 kHz stereo + WebRTC speaker echo cancellation")
+                }
                 try createAggregateDevice()
                 try openOutputFile()
                 makeCaptureSink()
-                if source.micDevice != nil, let captureFormat, let captureSink {
+                if speakerMode, let captureSink {
+                    let paused = pausedLock, save = speakerSaveState, micGain = micGainLock
+                    let appGain = sourceGainLock, meter = self.meter
+                    let warmup = UInt64(warmupSeconds * 48_000)
+                    let failure = finalError, writer = self.writer
+                    speakerPipeline = try SpeakerRecordingPipeline(fileURL: fileURL, tapRate: tapRate, controls: {
+                        let enabled = meter.totalFrames + 480 >= warmup && !paused.withLock { $0 }
+                            && failure.withLock { $0 == nil } && writer?.failure == nil
+                        save.withLock { $0 = enabled }
+                        return .init(save: enabled, microphoneGain: micGain.withLock { $0 }, sourceGain: appGain.withLock { $0 })
+                    }, output: captureSink)
+                } else if source.micDevice != nil, let captureFormat, let captureSink {
                     microphoneMixer = try MicrophoneDrivenMixer(format: captureFormat, onBuffer: captureSink)
                 }
                 try installTapIOProc()
                 try CA.check(AudioDeviceStart(aggregateID, ioProcID), "AudioDeviceStart")
-                if let mic = source.micDevice { try startMicMixing(device: mic) }
+                if speakerMode, let mic = source.micDevice, let pipeline = speakerPipeline {
+                    let capture = MicCapture(device: mic, targetRate: 48_000, targetChannels: 1,
+                        timestampHandler: { abl, frames, time in pipeline.receiveMicrophone(abl, frames: frames, time: time) },
+                        onBuffer: { _, _ in })
+                    micCapture = capture
+                    try capture.start()
+                    pipeline.start()
+                } else if let mic = source.micDevice { try startMicMixing(device: mic) }
                 startMonitor(device: routingDevice)
             } else if let mic = source.micDevice {
                 // Mic-only: the microphone's own IOProc clocks the recording.
@@ -201,6 +256,7 @@ public final class ProcessTapRecorder: @unchecked Sendable {
             } else {
                 throw CA.Error(status: -1, context: "No capture source (need a tap or a microphone)")
             }
+            if speakerMode { startErrorWatch() }
         } catch {
             // Tear down any partially-created objects so we don't leak a tap or
             // aggregate device on a failed start.
@@ -217,6 +273,10 @@ public final class ProcessTapRecorder: @unchecked Sendable {
     /// Not real-time and can block briefly; callers with a UI (the menu-bar app) run this
     /// off the main thread. The CLI/MCP call it on their own (non-UI) threads.
     public func stop() {
+        lifecycleLock.lock(); defer { lifecycleLock.unlock() }
+        errorWatch?.cancel(); errorWatch = nil
+        speakerDeviceGuard?.stop()
+        speakerDeviceGuard = nil
         // 1. Stop the producers. AudioDeviceStop waits for the IOProc to go idle; the
         //    watchdog bounds that wait.
         micCapture?.stop()
@@ -231,7 +291,12 @@ public final class ProcessTapRecorder: @unchecked Sendable {
             }
         }
         // 2. No more enqueues can happen now — flush the remaining buffered audio and close.
+        speakerPipeline?.finish(error: recordingError ?? (speakerMode ? writer?.failure : nil))
+        if let failure = speakerPipeline?.error { finalError.withLock { if $0 == nil { $0 = failure } } }
         writer?.finish()
+        if speakerMode, let failure = writer?.failure { finalError.withLock { if $0 == nil { $0 = failure } } }
+        if let failure = recordingError { speakerPipeline?.reportFailure(failure) }
+        speakerPipeline = nil
         writer = nil
         // 3. Destroy the HAL objects.
         if aggregateID != 0 {
@@ -260,6 +325,8 @@ public final class ProcessTapRecorder: @unchecked Sendable {
     /// routing pipeline is rebuilt; capture, metering, and file-writing are untouched, so
     /// the recording continues seamlessly across the change.
     public func setRoutingDevice(_ device: AudioDeviceInfo?) {
+        lifecycleLock.lock(); defer { lifecycleLock.unlock() }
+        guard !speakerMode else { return }
         routingDevice = device
         monitor?.stop()
         monitor = nil
@@ -267,6 +334,22 @@ public final class ProcessTapRecorder: @unchecked Sendable {
         // the new device starts at low latency rather than ~half a second behind.
         ring?.reset()
         startMonitor(device: device)
+    }
+
+    private func startErrorWatch() {
+        let pipeline = speakerPipeline, writer = self.writer
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.nfl.tapdeck.speaker-errors"))
+        timer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            self.lifecycleLock.lock(); defer { self.lifecycleLock.unlock() }
+            if let error = self.recordingError ?? pipeline?.error ?? writer?.failure {
+                self.finalError.withLock { if $0 == nil { $0 = error } }
+                self.stop()
+            }
+        }
+        errorWatch = timer
+        timer.resume()
     }
 
     private func startMonitor(device: AudioDeviceInfo?) {
@@ -424,8 +507,12 @@ public final class ProcessTapRecorder: @unchecked Sendable {
         let ring = self.ring
         // Skip the initial device-start ramp: hold off file-writing this many frames.
         let warmupFrames = UInt64(warmupSeconds * captureFormat.sampleRate)
+        let speakerMode = self.speakerMode
+        let speakerSave = speakerSaveState
+        let finalError = self.finalError
 
         captureSink = { abl, frames in
+            if speakerMode, finalError.withLock({ $0 }) != nil { return }
             // Meter the incoming (post per-feed-gain, pre-EQ) signal, for diagnostics.
             let inputPeak = peakOf(abl)
             if inputPeak > meter.peak { meter.peak = inputPeak }
@@ -433,7 +520,8 @@ public final class ProcessTapRecorder: @unchecked Sendable {
             meter.totalFrames &+= UInt64(frames)
             // Route immediately, but only start writing the file past the warm-up and
             // while not paused (pause suspends disk writes, keeps monitoring).
-            let recordToFile = meter.totalFrames >= warmupFrames && !pausedLock.withLock { $0 }
+            let recordToFile = speakerMode ? speakerSave.withLock { $0 }
+                : meter.totalFrames >= warmupFrames && !pausedLock.withLock { $0 }
             let gain = gainLock.withLock { $0 }   // master record level (linear)
 
             // Passthrough when EQ is off (or the cycle is too large for scratch):
@@ -468,15 +556,18 @@ public final class ProcessTapRecorder: @unchecked Sendable {
         }
         let sourceGainLock = self.sourceGainLock
         let mixer = microphoneMixer
+        let speakerPipeline = self.speakerPipeline
         let channels = Int(captureFormat.channelCount)
 
         var newProcID: AudioDeviceIOProcID?
         try CA.check(
             AudioDeviceCreateIOProcIDWithBlock(&newProcID, aggregateID, nil) {
-                _, inInputData, _, _, _ in
+                _, inInputData, inputTime, _, _ in
                 let input = UnsafeMutableAudioBufferListPointer(UnsafeMutablePointer(mutating: inInputData))
                 let frames = frameCount(input, channels: channels)   // no allocation on the RT thread
-                if let mixer {
+                if let speakerPipeline {
+                    speakerPipeline.receiveApp(input, frames: frames, time: inputTime.pointee)
+                } else if let mixer {
                     mixer.receiveTap(input, frames: frames)
                 } else {
                     let sourceGain = sourceGainLock.withLock { $0 }

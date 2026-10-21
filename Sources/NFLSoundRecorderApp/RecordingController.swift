@@ -59,6 +59,17 @@ final class RecordingController: ObservableObject {
         }
     }
     @Published var mute = false { didSet { Prefs.set(mute, Prefs.mute) } }
+    @Published var speakerMode = false {
+        didSet {
+            guard speakerMode else { return }
+            selectedDeviceUID = Self.noRouteUID
+            mute = false
+            if selectedMicUID == Self.micOffUID,
+               let mic = inputDevices.first(where: { $0.uid == "BuiltInMicrophoneDevice" }) {
+                selectedMicUID = mic.uid
+            }
+        }
+    }
     @Published var recordLevelDB: Double = 0 { didSet { Prefs.set(recordLevelDB, Prefs.recordLevel) } }
     /// Per-feed levels (dB) for balancing a mix; shown for the active feed(s).
     @Published var sourceLevelDB: Double = 0 { didSet { Prefs.set(sourceLevelDB, Prefs.sourceLevel) } }
@@ -91,6 +102,7 @@ final class RecordingController: ObservableObject {
     @Published var vizMode: VizMode = .bars
     @Published var lastError: String?
     @Published var lastFileURL: URL?
+    @Published var lastSourceFilesURL: URL?
 
     /// Everything the 30 Hz tick rewrites — meters, reels, elapsed clock. A separate
     /// object (not `@Published` here, so mutating it never invalidates the panel) observed
@@ -351,7 +363,7 @@ final class RecordingController: ObservableObject {
         let url = newFileURL(format: recordingFormat)
         let rec = ProcessTapRecorder(source: captureSource, outputDevice: device, fileURL: url,
                                      format: recordingFormat, mute: mute,
-                                     driftCompensation: false)
+                                     driftCompensation: false, speakerMode: speakerMode)
 
         // Optimistic UI: flip to "recording" immediately so the menu stays responsive; the
         // blocking HAL start runs off-main below and confirms (or reverts) when it returns.
@@ -359,6 +371,7 @@ final class RecordingController: ObservableObject {
         let gen = lifecycleGeneration
         recordingSourceLabel = sourceLabel
         lastFileURL = url
+        lastSourceFilesURL = rec.sourceFilesURL
         startDate = nil          // set on confirmation so the elapsed clock starts at 0
         pausedAt = nil; pausedTotal = 0; isPaused = false
         meters.elapsedText = "00:00"
@@ -438,7 +451,12 @@ final class RecordingController: ObservableObject {
                 Task { @MainActor in
                     // Only claim "Saved" if the user hasn't started a new recording since.
                     guard let self, !self.isRecording else { return }
-                    self.statusText = "Saved \(name)."
+                    if let error = rec.recordingError {
+                        self.lastError = error
+                        self.statusText = "Recording stopped; partial files saved."
+                    } else {
+                        self.statusText = "Saved \(name)."
+                    }
                 }
             }
         } else {
@@ -537,12 +555,17 @@ final class RecordingController: ObservableObject {
 
     func revealLastFile() {
         guard let url = lastFileURL else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([url])
+        NSWorkspace.shared.activateFileViewerSelecting([url] + (lastSourceFilesURL.map { [$0] } ?? []))
     }
 
     /// Publishes a meter frame. Every write lands on `meters`, never on `self`, so a frame
     /// invalidates only the cassette / meter / menu-bar-icon views rather than the whole panel.
     private func tick() {
+        if let error = recorder?.recordingError {
+            stop()
+            lastError = error
+            return
+        }
         // Paused: hold the reels, meters, and clock where they are.
         guard !isPaused else { return }
         if let recorder {

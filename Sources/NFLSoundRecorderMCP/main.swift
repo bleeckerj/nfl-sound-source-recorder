@@ -179,14 +179,17 @@ final class MCPServer {
 
         case "stop_recording":
             if let stopped = session.stop() {
-                return (Self.json(["stopped": true, "file": stopped.url.path, "durationSeconds": Int(stopped.duration)]), false)
+                return (Self.json(["stopped": true, "file": stopped.url.path, "durationSeconds": Int(stopped.duration),
+                                   "error": stopped.error ?? "", "sourceFiles": stopped.sources?.path ?? "", "speakerMode": stopped.sources != nil]), stopped.error != nil)
             }
             return ("Not currently recording.", true)
 
         case "recording_status":
             if let active = session.active {
                 return (Self.json([
-                    "isRecording": true, "source": active.sourceLabel, "device": active.deviceName,
+                    "isRecording": session.isRecording, "source": active.sourceLabel, "device": active.deviceName,
+                    "speakerMode": active.recorder.isSpeakerMode, "error": active.recorder.recordingError ?? "",
+                    "sourceFiles": active.recorder.sourceFilesURL?.path ?? "",
                     "file": active.fileURL.path, "elapsedSeconds": Int(session.elapsed ?? 0),
                     "paused": session.isPaused,
                     "framesCaptured": Int(active.recorder.meter.totalFrames),
@@ -203,6 +206,10 @@ final class MCPServer {
     }
 
     private func startRecording(_ args: [String: Any]) -> (text: String, isError: Bool) {
+        let speakerMode = (args["speaker_mode"] as? Bool) ?? false
+        if speakerMode, ((args["mute"] as? Bool) == true || ((args["output_uid"] as? String).map { $0.lowercased() != "none" } ?? false)) {
+            return ("Speaker mode requires output_uid 'none' and mute false.", true)
+        }
         // Resolve the tap target (if any). `source: "microphone"` (or "none") records the
         // mic alone — no tap.
         var tapTarget: ProcessTapRecorder.Target?
@@ -259,7 +266,7 @@ final class MCPServer {
         // Resolve the output device. `output_uid: "none"` records only (no routing).
         let device: AudioDeviceInfo?
         do {
-            device = try outputDevice(for: args["output_uid"] as? String)
+            device = try outputDevice(for: speakerMode ? "none" : args["output_uid"] as? String)
         } catch {
             return (Self.errorText(error), true)
         }
@@ -289,12 +296,13 @@ final class MCPServer {
 
         do {
             try session.start(source: captureSource, sourceLabel: label, device: device, mute: mute,
-                              driftCompensation: driftCompensation, warmupSeconds: warmupSeconds,
+                              driftCompensation: driftCompensation, warmupSeconds: warmupSeconds, speakerMode: speakerMode,
                               sourceLevelDB: sourceLevelDB, micLevelDB: micLevelDB,
                               format: format, fileURL: fileURL)
             return (Self.json([
                 "started": true, "source": label, "device": device?.name ?? "(record only)", "mute": mute,
                 "driftCompensation": driftCompensation, "format": format.rawValue, "file": fileURL.path,
+                "speakerMode": speakerMode, "sourceFiles": session.active?.recorder.sourceFilesURL?.path ?? "",
             ]), false)
         } catch {
             return ("Failed to start recording: \(error)", true)
@@ -351,6 +359,7 @@ final class MCPServer {
                     "source_level_db": ["type": "number", "description": "Tap/system feed level in dB (0 = unity). Use with mic_level_db to balance a mix."],
                     "mic_level_db": ["type": "number", "description": "Microphone feed level in dB (0 = unity). Use with source_level_db to balance a mix."],
                     "output_uid": stringProp("UID of the output device from list_output_devices, or 'none' to record only (no routing). Defaults to the current default output. Tip: with a microphone, prefer 'none' or headphones to avoid feedback."),
+                    "speaker_mode": ["type": "boolean", "description": "Enable local WebRTC speaker echo cancellation. Requires app/system audio, microphone 'default' or a built-in microphone UID, and built-in speakers. Uses record-only routing and keeps original source tracks beside the mix (about 46 MB/min). Default false."],
                     "mute": ["type": "boolean", "description": "If true, mute the source's normal output so only the routed copy is heard (reroute). Default false."],
                     "drift_compensation": ["type": "boolean", "description": "Resample the tap to the output clock. Default false; enabling can add a brief level ramp at the start."],
                     "warmup_seconds": ["type": "number", "description": "Hold off file-writing this long to skip Core Audio's device-start volume ramp. Default 0.6; use 0 to keep the raw ramp."],

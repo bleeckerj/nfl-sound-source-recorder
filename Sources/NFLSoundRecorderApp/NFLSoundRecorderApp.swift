@@ -288,6 +288,8 @@ struct MenuContentView: View {
                 .disabled(controller.isRecording)
             }
 
+            SpeakerModeControls(controller: controller)
+
             VStack(alignment: .leading, spacing: 4) {
                 Text("Route to").font(.caption).foregroundStyle(.secondary)
                 // Routing can be changed live, even mid-recording — see
@@ -299,6 +301,7 @@ struct MenuContentView: View {
                     }
                 }
                 .labelsHidden()
+                .disabled(controller.speakerMode)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -314,7 +317,7 @@ struct MenuContentView: View {
 
             Toggle("Reroute (mute original output)", isOn: $controller.mute)
                 // Nothing to reroute to when recording only.
-                .disabled(controller.isRecording || controller.selectedDeviceUID == RecordingController.noRouteUID)
+                .disabled(controller.isRecording || controller.speakerMode || controller.selectedDeviceUID == RecordingController.noRouteUID)
                 .toggleStyle(.switch)
                 .controlSize(.small)
 

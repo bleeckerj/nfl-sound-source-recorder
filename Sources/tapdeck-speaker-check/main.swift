@@ -59,7 +59,7 @@ do {
             }
         }
         let qualification = try SpeakerQualification(directory: URL(fileURLWithPath: path, isDirectory: true))
-        watchdog.begin("native audio initialization", seconds: 15)
+        watchdog.begin("WebRTC audio initialization", seconds: 15)
         try qualification.start()
         let playback = Process()
         playback.executableURL = URL(fileURLWithPath: "/usr/bin/afplay")
