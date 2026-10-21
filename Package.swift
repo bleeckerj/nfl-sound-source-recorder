@@ -31,6 +31,10 @@ let package = Package(
             dependencies: ["SoundRecorderKit"],
             path: "Sources/NFLSoundRecorderMCP"
         ),
+        .executableTarget(
+            name: "tapdeck-speaker-check",
+            dependencies: ["SoundRecorderKit"]
+        ),
         .testTarget(
             name: "SoundRecorderKitTests",
             dependencies: ["SoundRecorderKit"]
