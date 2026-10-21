@@ -9,6 +9,8 @@ final class VoiceProcessingCapture {
     private var unit: AudioUnit?
     private var buffer: AVAudioPCMBuffer?
     private var handler: Handler?
+    private var initialized = false
+    private var running = false
     private(set) var format: AVAudioFormat?
     private(set) var reportedLatency: TimeInterval = 0
 
@@ -43,10 +45,9 @@ final class VoiceProcessingCapture {
             let captureFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
                                              channels: 1, interleaved: true)!
             var microphoneFormat = captureFormat.streamDescription.pointee
-            var speakerFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
-                                             channels: 2, interleaved: true)!.streamDescription.pointee
             try set(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Output, 1, &microphoneFormat)
-            try set(kAudioUnitProperty_StreamFormat, kAudioUnitScope_Input, 0, &speakerFormat)
+            // Leave the silent render bus in its native format. The zero-fill
+            // callback supports packed or planar output at any device rate.
             var capacity: UInt32 = 4096
             try set(kAudioUnitProperty_MaximumFramesPerSlice, kAudioUnitScope_Global, 0, &capacity)
             try set(kAUVoiceIOProperty_BypassVoiceProcessing, kAudioUnitScope_Global, 0, &disabled)
@@ -73,12 +74,14 @@ final class VoiceProcessingCapture {
             }, inputProcRefCon: Unmanaged.passUnretained(self).toOpaque())
             try set(kAudioOutputUnitProperty_SetInputCallback, kAudioUnitScope_Global, 0, &inputCallback)
             try CA.check(AudioUnitInitialize(created), "Initialize VoiceProcessingIO")
+            initialized = true
             var latency: Float64 = 0
             var size = UInt32(MemoryLayout<Float64>.size)
             if AudioUnitGetProperty(created, kAudioUnitProperty_Latency, kAudioUnitScope_Global, 0,
                                     &latency, &size) == noErr { reportedLatency = latency }
             format = captureFormat
             try CA.check(AudioOutputUnitStart(created), "Start VoiceProcessingIO")
+            running = true
         } catch {
             stop()
             throw error
@@ -100,9 +103,11 @@ final class VoiceProcessingCapture {
 
     func stop() {
         guard let unit else { return }
-        AudioOutputUnitStop(unit)
-        AudioUnitUninitialize(unit)
+        if running { AudioOutputUnitStop(unit) }
+        if initialized { AudioUnitUninitialize(unit) }
         AudioComponentInstanceDispose(unit)
+        running = false
+        initialized = false
         self.unit = nil
         buffer = nil
         handler = nil

@@ -32,7 +32,10 @@ public final class SpeakerQualification {
                           uid: try CA.string(id, kAudioDevicePropertyDeviceUID),
                           builtIn: transport == kAudioDeviceTransportTypeBuiltIn)
         }
-        return try (describe(AudioSystem.defaultInputDevice()), describe(AudioSystem.defaultOutputDevice()))
+        // Match the app's main-thread HAL bootstrap: resolve output before input.
+        let output = try AudioSystem.defaultOutputDevice()
+        let input = try AudioSystem.defaultInputDevice()
+        return try (describe(input), describe(output))
     }
 
     /// Refuse previously used destinations before creating or opening any source file.

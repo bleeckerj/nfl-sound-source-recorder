@@ -1,6 +1,6 @@
 # Speaker recording qualification
 
-The higher-quality speaker mode is awaiting hardware qualification. It is not
+The native higher-quality speaker mode failed hardware qualification. It is not
 available in the TapDeck interface, normal CLI, or MCP interface yet.
 
 The first milestone adds native VoiceProcessingIO capture and a separate,
@@ -20,13 +20,25 @@ recording paths and user interface are unchanged.
   input device, before reaching the replacement native implementation. A stack
   sample confirmed the blocked Core Audio initialization. Only that diagnostic
   process was terminated. A subsequent bounded system audio inventory was empty.
+- Two authenticated audio-service restarts restored device discovery. Attempts 3
+  and 4 rejected custom silent-output formats with OSStatus -10868; attempt 5
+  timed out during device discovery. The corrected implementation leaves the
+  render bus in its native format and only tears down initialized/running stages.
+- Attempt 6 reached direct VoiceProcessingIO initialization after a successful
+  restart and failed with OSStatus -10875. No capture or playback began. Both
+  AVAudioEngine and direct VoiceProcessingIO have now failed the initialization
+  gate on this Mac. Device discovery stalled again afterward.
+- A final authenticated cleanup restart restored device discovery. The bounded
+  device-only diagnostic resolved the MacBook Air microphone and speakers and
+  exited successfully. No further native capture attempts followed that check.
 - No acoustic suppression measurement, overlapping-speech assessment, Zoom
   coexistence test, or long-duration test has passed. The 20 dB reduction target
   remains unverified.
 
 Test files are kept under
 `/Users/julian/Music/TapDeck/Speaker Mode Qualification/`.
-The first test's CAF files contain no captured audio. They are failure evidence.
+The CAF files from failed initialization contain no captured audio. They are
+failure evidence. Each test has a separate folder; failed runs are never reused.
 
 ## Build and run
 
@@ -68,12 +80,15 @@ a known speech sample and listening tests before enabling a speaker recording UI
 - Help and invalid-duration checks exit without initializing audio or starting capture.
 - The device-discovery watchdog was exercised against the stalled audio query; it
   exited with status 3 and a clear timeout after ten seconds.
-- The two failed test folders contain structured failure reports. The second also
-  contains the relevant blocked-thread stack trace.
+- The test folders contain `failure.json`; `2026-10-20-test-2` also contains
+  `blocked-thread.txt` from the stalled device query.
 
 ## Remaining implementation
 
-After native capture passes qualification, implement timestamp-aligned app/raw/clean
-capture, the finished mix and retained source tracks, explicit speaker-mode controls
-in the app/CLI/MCP, interruption handling, and the acceptance tests in the approved
-plan. Do not enable a speaker mode that silently substitutes raw app-plus-mic audio.
+- After an audio backend passes qualification, implement timestamp-aligned
+  app/raw/clean capture, the finished mix and retained source tracks, explicit
+  speaker-mode controls in the app/CLI/MCP, interruption handling, and the
+  acceptance tests in the approved plan.
+- A processing failure must finalize the mix and source files and display its
+  reason in the app, CLI, or MCP result. Raw app-plus-mic capture cannot replace
+  echo cancellation without an explicit change of recording mode.

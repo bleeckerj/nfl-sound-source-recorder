@@ -41,6 +41,8 @@ do {
     })
     defer { withExtendedLifetime(watchdog) {} }
     _ = NSApplication.shared
+    print("Discovering built-in audio devices…")
+    fflush(stdout)
     let devices = try SpeakerQualification.defaultDevices()
     try emit(["microphone": devices.microphone, "speaker": devices.speaker])
     if !devicesOnly, let path = capturePath, let duration = captureDuration {
