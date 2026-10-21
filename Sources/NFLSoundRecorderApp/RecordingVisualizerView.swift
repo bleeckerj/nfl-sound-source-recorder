@@ -135,7 +135,7 @@ struct DeckTransport: View {
         HStack(spacing: 8) {
             DeckButton(systemImage: "record.circle.fill", label: "REC", tint: recRed,
                        engaged: controller.isRecording && !controller.isPaused,
-                       enabled: !controller.isRecording) {
+                       enabled: !controller.isRecording && controller.speakerModeSelectionError == nil) {
                 controller.start()
             }
             DeckButton(systemImage: "pause.fill", label: "PAUSE", tint: amber,

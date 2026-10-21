@@ -12,6 +12,11 @@ built-in microphone if it is not already selected. The switch sets Route to None
 and leaves the original app output audible. Routing controls stay disabled for
 this recording mode. Echo cancellation adapts during the first few seconds.
 
+Record must be the call app or All System Audio. **None — microphone only** has no
+direct app audio for the echo reference. The controls show a setup warning when
+either source is missing, and Record checks both selections before requesting
+permissions or starting capture. To record only the microphone, turn off Open speakers.
+
 CLI example:
 
 ```sh

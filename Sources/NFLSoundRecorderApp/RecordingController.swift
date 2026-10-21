@@ -260,6 +260,11 @@ final class RecordingController: ObservableObject {
         return inputDevices.first(where: { $0.uid == selectedMicUID })
     }
 
+    var speakerModeSelectionError: SpeakerModeConfiguration.SelectionError? {
+        guard speakerMode else { return nil }
+        return SpeakerModeConfiguration.selectionError(hasAppAudio: sourceHasTap, hasMicrophone: sourceHasMic)
+    }
+
     func toggle() { isRecording ? stop() : start() }
 
     /// Gate on the consents the chosen recording actually needs — System Audio Recording
@@ -267,6 +272,9 @@ final class RecordingController: ObservableObject {
     /// mic — then begin. Each is only requested when its source is in play.
     func start() {
         lastError = nil
+        if let error = speakerModeSelectionError {
+            lastError = error.description; return
+        }
         let target = sources.first(where: { $0.id == selectedSourceID })?.makeTarget()
         let needsTap = target != nil
         let needsMic = selectedMic != nil
@@ -333,6 +341,10 @@ final class RecordingController: ObservableObject {
 
     private func beginRecording() {
         lastError = nil
+        // Selections may have changed while a permission prompt was open.
+        if let error = speakerModeSelectionError {
+            lastError = error.description; return
+        }
         guard let sourceOption = sources.first(where: { $0.id == selectedSourceID }) else {
             lastError = "Pick a source."; return
         }

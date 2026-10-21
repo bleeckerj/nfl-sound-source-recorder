@@ -10,8 +10,14 @@ struct SpeakerModeControls: View {
                 .controlSize(.small)
                 .disabled(controller.isRecording)
             if controller.speakerMode {
-                Text("Use the built-in Mac speakers and microphone. Select the call app above. Echo cancellation adapts over the first few seconds.")
-                    .font(.caption).foregroundStyle(.secondary)
+                if let error = controller.speakerModeSelectionError {
+                    Text(error.description)
+                        .font(.caption).foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("TapDeck uses the selected app audio as the echo reference. Use the built-in Mac speakers and microphone. Echo cancellation adapts over the first few seconds.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Text("Original app and microphone tracks are kept beside the mix (about 46 MB/min).")
                     .font(.caption).foregroundStyle(.secondary)
             }

@@ -196,17 +196,20 @@ public final class ProcessTapRecorder: @unchecked Sendable {
         lifecycleLock.lock(); defer { lifecycleLock.unlock() }
         do {
             if speakerMode {
+                if let error = SpeakerModeConfiguration.selectionError(
+                    hasAppAudio: source.tapTarget != nil, hasMicrophone: source.micDevice != nil) {
+                    throw error
+                }
                 for path in [fileURL, sourceFilesURL!] {
                     guard !FileManager.default.fileExists(atPath: path.path) else {
                         throw CA.Error(status: -1, context: "Speaker recording destination already exists: \(path.path)")
                     }
                 }
-                guard case .mix(_, let mic) = source else {
-                    throw CA.Error(status: -1, context: "Speaker mode requires app or system audio plus a microphone")
-                }
-                try SpeakerRecordingPipeline.validate(microphone: mic, output: routingDevice, mute: mute)
-                speakerDeviceGuard = try SpeakerDeviceGuard(microphone: mic) { [finalError] message in
-                    finalError.withLock { if $0 == nil { $0 = message } }
+                if let mic = source.micDevice {
+                    try SpeakerRecordingPipeline.validate(microphone: mic, output: routingDevice, mute: mute)
+                    speakerDeviceGuard = try SpeakerDeviceGuard(microphone: mic) { [finalError] message in
+                        finalError.withLock { if $0 == nil { $0 = message } }
+                    }
                 }
             }
             if let target = source.tapTarget {
