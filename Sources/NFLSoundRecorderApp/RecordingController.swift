@@ -6,6 +6,7 @@ import SoundRecorderKit
 
 enum VizMode: String, CaseIterable, Identifiable {
     case bars = "Bars"
+    case spectrum = "Spectrum"
     case scope = "Scope"
     var id: String { rawValue }
 }
@@ -99,7 +100,10 @@ final class RecordingController: ObservableObject {
     @Published var isRecording = false
     @Published var isPaused = false
     @Published var statusText = "Idle"
-    @Published var vizMode: VizMode = .bars
+    /// Opens on the analyzer: it is the display that says the most about arbitrary
+    /// material, and unlike the phase scope it reads the same whether the source is mono
+    /// or stereo.
+    @Published var vizMode: VizMode = .spectrum
     @Published var lastError: String?
     @Published var lastFileURL: URL?
     @Published var lastSourceFilesURL: URL?
@@ -585,10 +589,15 @@ final class RecordingController: ObservableObject {
             case .bars:
                 meters.bandLevels = recorder.spectrum.levels()
                 meters.bandPeaks = recorder.spectrum.peakLevels()
+            case .spectrum:
+                meters.spectrumCurve = recorder.spectrum.curve()
+                meters.spectrumPeaks = recorder.spectrum.curvePeaks()
             case .scope:
                 let s = recorder.scope.snapshot()
                 meters.scopeLeft = s.left
                 meters.scopeRight = s.right
+                meters.scopeCorrelation = StereoScope.correlation(left: s.left, right: s.right)
+                meters.scopeIsMono = recorder.scope.layout().isMonoSource
             }
         }
         // Smoothed live level (0...1) for the menu-bar icon's hub swell: map the

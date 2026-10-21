@@ -3,7 +3,7 @@
 # TapDeck
 
 **Tap any app's — or all of your Mac's — audio, mix in your microphone, record it to a file, and route it live to any output device.**
-A skeuomorphic cassette deck for macOS, driven by Core Audio process taps. No virtual audio driver, no kernel extension.
+A skeuomorphic cassette deck for macOS, driven by Core Audio process taps.
 
 <img src="https://imagedelivery.net/gaLGizR3kCgx5yRLtiRIOw/9ca8be40-cf8d-4d31-37dd-90513e57a900/public" width="440" alt="TapDeck's cassette tape deck with transport keys and a live 10-band LED spectrum meter" />
 
@@ -14,7 +14,7 @@ A skeuomorphic cassette deck for macOS, driven by Core Audio process taps. No vi
 
 </div>
 
-TapDeck is the flagship menu-bar app of a proof-of-concept that does **the core of what SoundSource does, minus the effects**: it captures an audio-first application's (or the whole system's) audio, writes it to a file, and simultaneously copies it to an output device you choose — all through one Core Audio IO callback.
+TapDeck captures an application's or the whole system's audio, mixes in an optional microphone, applies a 10-band EQ, and saves the result. Optional live routing sends the audio to a selected output device. The menu-bar app, CLI, and MCP server share the same recording engine.
 
 It ships **three front ends over one shared engine**:
 
@@ -26,7 +26,16 @@ Because it uses **Core Audio process taps** (`AudioHardwareCreateProcessTap`, ma
 
 ## The app
 
-Pick a **Record** source, a **Route to** device, dial in the **10-band graphic EQ**, and hit **REC**. The tape reels spin, the meters come alive, and the same signal is written to disk and played out your chosen device. Watch levels as a **10-band LED spectrum**, or flip to the green-phosphor **Lissajous scope** to see the stereo field.
+Pick a **Record** source, select **None (record only)** or an output device under **Route to**, adjust the **10-band graphic EQ**, and press **REC**. The tape reels spin while recording, and the display opens in **Spectrum** mode.
+
+| Display | What it shows |
+|---------|---------------|
+| **Bars** | Ten octave-band level meters with falling peak indicators. |
+| **Spectrum** | A continuous, 96-point spectrum curve from 25 Hz to 20 kHz, with a peak trace. The shared FFT uses 4,096 samples. |
+| **Scope** | A stereo goniometer with channel correlation and MONO/STEREO labels. Identical audible channels use a labeled phase display of the signal against a delayed copy. |
+
+The mono phase display does not create a stereo image. Its label identifies the
+0.7 ms delay used for the plot; the recorded audio is unchanged by the display mode.
 
 <table>
 <tr>
@@ -47,8 +56,14 @@ Pick a **Record** source, a **Route to** device, dial in the **10-band graphic E
 
 ```sh
 ./Scripts/make-app.sh
-open "dist/TapDeck.app"
+open "/Applications/TapDeck.app"
 ```
+
+The default command builds a signed **release** bundle at `dist/TapDeck.app` and
+installs a copy at `/Applications/TapDeck.app`. Stop any active recording before
+replacing the installed app. Use `./Scripts/make-app.sh --no-install` to build
+without replacing it, or add `--debug` for a debug build. WebRTC processing is
+optimized in both configurations. Building and signing do not notarize the app.
 
 A waveform icon appears in the menu bar. Pick a **Record** source (an audio-first app, all system audio, or **None — microphone only**), optionally add a **Microphone** to mix in, choose a **Route to** device, optionally **Reroute (mute original output)**, dial in the **10-band Equalizer** (toggle + per-band sliders, adjustable live while recording), then **Record**. Files land in `~/Music/TapDeck/`. It's a menu-bar-only agent (`LSUIElement`) — no Dock icon.
 
@@ -56,7 +71,35 @@ A waveform icon appears in the menu bar. Pick a **Record** source (an audio-firs
 
 On first Record, macOS prompts for the permission each source needs: **audio-capture** for a tap (under **Screen & System Audio Recording**) and **Microphone** for the mic. Grant them and Record again.
 
-> ⚠️ **Feedback:** if you mix the mic *and* route to speakers, the mic hears the speakers and howls. Use headphones, or route to **None (record only)**. TapDeck shows a hint but doesn't stop you.
+**Microphone monitoring.** Routing the microphone back to speakers can cause
+feedback. Use headphones or **None (record only)** for ordinary microphone
+recording. An open microphone also hears audio that other apps play through the
+speakers. Use the speaker mode below when combining direct app audio with a
+microphone in that setup.
+
+### Open speakers: echo cancellation
+
+This optional mode uses local WebRTC AEC3 processing. It currently supports the
+**built-in Mac microphone and speakers**.
+
+1. Under **Record**, select the call app, such as Zoom, or **All System Audio**.
+2. Under **Microphone**, select the built-in microphone.
+3. Enable **Open speakers: echo cancellation**. TapDeck sets Route to **None** and
+   keeps the original app output audible.
+4. Press **REC**. Echo cancellation adapts during the first few seconds.
+
+The direct app audio supplies the echo reference. **None — microphone only**
+cannot supply that reference. If app audio or the microphone is missing, the
+controls show setup guidance and disable REC. To record only the microphone,
+turn off Open speakers.
+
+TapDeck saves the mix and a neighboring `.sources` folder containing direct app
+audio, raw microphone audio, cleaned microphone audio, and `session.json`.
+These source tracks use approximately **46 MB/min**, in addition to the mix.
+
+See [speaker recording setup and qualification](docs/speaker-mode-qualification.md)
+for supported devices, timing, diagnostic commands, and the limits of the
+completed tests. Live Zoom overlapping speech and a 90-minute capture remain unverified.
 
 ## Layout
 
@@ -66,26 +109,26 @@ Sources/
   nfl-sound-recorder/     command-line front end
   NFLSoundRecorderApp/    menu bar app (SwiftUI MenuBarExtra) — "TapDeck"
   NFLSoundRecorderMCP/    MCP server (JSON-RPC over stdio, no external deps)
+  tapdeck-speaker-check/  bounded speaker qualification command
 Scripts/
   make-app.sh             bundles the menu bar app into dist/TapDeck.app
   make-mcp-app.sh         bundles the MCP server into dist/TapDeck MCP.app
   make-cli-app.sh         bundles the CLI (so it can obtain capture permission)
+  make-speaker-check-app.sh  bundles the speaker qualification command
+docs/
+  speaker-mode-qualification.md  setup, evidence, and pending hardware checks
 ```
 
 ## How it works
 
-```
-  ┌────────────────────┐  process tap   ┌──────────────────────────────┐
-  │  Audio-first app / │ ─────────────► │  Aggregate device            │
-  │  all system audio  │                │   • tap        (input)       │
-  └────────────────────┘                │   • output dev (output)      │
-                                        └──────────────┬───────────────┘
-                                                       │  one IOProc callback
-                                             ┌─────────┴──────────┐
-                                             ▼                    ▼
-                                       write to file        copy to output
-                                       (Recording.caf)      (plays on device)
-```
+The process tap delivers app audio through a private aggregate device. A selected
+microphone is captured on its own device clock and advances mixed recordings
+even when the app is silent. Speaker mode aligns both feeds on a shared 48 kHz
+timeline and cleans the microphone using the app audio as the echo reference.
+
+The capture sink applies levels and EQ, updates the meters, and queues file
+writing to a worker. Optional output routing uses a separate monitor pipeline;
+changing the output device does not restart capture.
 
 A **10-band graphic EQ** ([`GraphicEQ`](Sources/SoundRecorderKit/GraphicEQ.swift)) sits in the IO callback between capture and both outputs, so its effect applies to the recording *and* the routed audio. It's a serial cascade of peaking biquad filters (RBJ cookbook) at ISO center frequencies 32 Hz–16 kHz. The meters and scope are driven from the same post-EQ stream.
 
@@ -105,7 +148,7 @@ The server speaks MCP over stdio and exposes eleven tools:
 | `list_applications` | Live list of audio-first apps: `name`, `bundleId`, `pid`, `isPlaying`. |
 | `list_output_devices` | Live list of outputs: `name`, `uid`, `channels`, `isDefault`. |
 | `list_input_devices` | Live list of microphones/inputs: `name`, `uid`, `channels`, `isDefault`. |
-| `start_recording` | Start capture + route. Args: `source` (`"system"`, a bundle id, or `"microphone"` for mic-only), optional `pid`, `microphone` (`"default"` or an input uid, to mix the mic in), `source_level_db`/`mic_level_db` (balance the feeds), `output_uid` (`"none"` to record only), `mute`, `file_path`. |
+| `start_recording` | Start capture + route. Args: `source` (`"system"`, a bundle id, or `"microphone"` for mic-only), optional `pid`, `microphone` (`"default"` or an input uid), `speaker_mode` (requires app/system audio plus a built-in mic and speakers), `source_level_db`/`mic_level_db`, `output_uid` (`"none"` to record only), `mute`, `file_path`. |
 | `set_equalizer` | Enable/disable the 10-band EQ and set per-band gains in dB (bands 32 Hz–16 kHz). Applies live. |
 | `pause_recording` | Pause file writing while keeping capture and monitoring active. |
 | `resume_recording` | Resume a paused recording. |
@@ -136,6 +179,12 @@ Register it with an MCP client. For Claude Desktop, add to `~/Library/Applicatio
 ```
 
 A typical LLM flow: call `list_applications` and `list_output_devices` to see what's available, then `start_recording` with a chosen `source` + `output_uid`, then `stop_recording`. To capture commentary too, add `microphone: "default"` (and balance with `source_level_db`/`mic_level_db`); to record just the mic, use `source: "microphone"`.
+
+For speaker echo cancellation, pass `speaker_mode: true` with an app/system source
+and the built-in microphone. The default microphone must be built in when using
+`microphone: "default"`. This mode records without routing and rejects muting the
+original output. Recording status and stop results include `speakerMode`,
+`sourceFiles`, and any recording error.
 
 The MCP executable is a separate front end to the shared recorder engine. A recording started through MCP is controlled through that MCP session; a recording started from the menu-bar app is not automatically attached to it.
 
@@ -183,6 +232,10 @@ swift build
 # MIX system audio + mic into one file, mic 6 dB down to balance it:
 .build/debug/nfl-sound-recorder --system --mic-default --no-route \
     --source-level 0 --mic-level -6 --file ~/screencast.caf
+
+# Cancel speaker echo using direct app/system audio and the built-in microphone:
+.build/debug/nfl-sound-recorder --system --mic-default --speaker-mode \
+    --file ~/meeting.m4a
 ```
 
 **Important — silent recordings:** a bare SwiftPM binary has no `Info.plist`, so macOS can't show the audio-capture prompt, and process taps then return **silence** (the file records, but it's all zeros). For real capture, run the *bundled* CLI:
@@ -196,6 +249,33 @@ While recording, the CLI prints the capture format and a **live level meter**. I
 
 **One-command check:** `./Scripts/test-recording.sh` builds the bundled CLI, plays a known sound, captures 6 seconds of system audio, and reports whether any signal was captured (writes to `/tmp/nfl-test.caf`). Use `--duration <sec>` for your own hands-free timed captures.
 
+### Offline checks and stereo diagnostics
+
+Run the automated tests and generated-tone checks without capturing a microphone
+or app audio:
+
+```sh
+swift test
+.build/debug/nfl-sound-recorder --selftest-eq
+.build/debug/nfl-sound-recorder --selftest-spectrum
+.build/debug/nfl-sound-recorder --selftest-scope
+```
+
+The scope check covers interleaved and planar buffers, mono and inverted signals,
+correlation, panning orientation, and sample continuity.
+
+For a live source, `--probe-stereo` prints the delivered buffer shape and observed
+channel differences. It captures a temporary file using existing system
+audio permission, then removes that file. For example, after building the bundled CLI:
+
+```sh
+"dist/TapDeck CLI.app/Contents/MacOS/nfl-sound-recorder" \
+  --app us.zoom.xos --probe-stereo --seconds 3
+```
+
+Speaker-mode acoustic qualification has its own
+[bounded diagnostic and evidence notes](docs/speaker-mode-qualification.md).
+
 ## Distribution (signing & notarization)
 
 To hand the menu-bar app to other people, it needs a Developer ID signature, the
@@ -205,8 +285,7 @@ Hardened Runtime, and Apple notarization — otherwise Gatekeeper blocks it on t
 certificate is in your keychain it signs with it under the Hardened Runtime, applying
 [`Scripts/TapDeck.entitlements`](Scripts/TapDeck.entitlements) (just the microphone —
 system-audio recording is runtime TCC consent, not an entitlement). Without that cert it
-falls back to an ad-hoc signature so a fresh clone still builds. Override with
-`SIGN_IDENTITY="Developer ID Application: …"`.
+falls back to an ad-hoc signature so a fresh clone still builds.
 
 For a **notarized, stapled `.dmg`** ready to download, run [`Scripts/release-app.sh`](Scripts/release-app.sh):
 
@@ -216,22 +295,22 @@ xcrun notarytool store-credentials "tapdeck" \
     --apple-id "you@example.com" --team-id 9DCTLJ9BY7 --password "app-specific-password"
 
 # build → notarize the app → staple → build DMG → notarize + staple the DMG → verify
-NOTARY_PROFILE="tapdeck" ./Scripts/release-app.sh
+./Scripts/release-app.sh tapdeck
 ```
 
 It staples both the app and the DMG (so first launch works offline) and verifies with
 `spctl`/`stapler`. The output `dist/TapDeck-<version>.dmg` passes Gatekeeper cleanly.
 A stable Developer ID signature also fixes the ad-hoc build's re-prompt-every-rebuild
-behaviour — the TCC grants stick across rebuilds.
+behavior — the TCC grants stick across rebuilds.
 
 > Requires the full-Xcode toolchain to be license-accepted (`sudo xcodebuild -license accept`),
 > since notarization uses `notarytool` from Xcode.
 
 ## Known limitations (it's a POC)
 
-- **Format matching:** the routing `memcpy` assumes the tap and output device share channel count / sample rate (true for the common stereo case). A shipping app would run frames through an `AVAudioConverter` when they differ.
-- **Real-time safety:** writing to `AVAudioFile` and taking the EQ's `os_unfair_lock` inside the IOProc can allocate/block; production code would push frames to a lock-free ring buffer, write on a separate thread, and hand off EQ coefficients lock-free.
-- **Single recording at a time**, single output.
+- **Speaker mode devices:** echo cancellation currently requires the built-in Mac microphone and speakers. External speakers, USB microphones, and Bluetooth devices have not been qualified for this mode.
+- **Callback work:** EQ processing still runs in the capture callback and shares a lock with its controls. File writing and output monitoring use separate workers.
+- **One active recording per front-end session**, with one optional output device. App and MCP sessions operate independently.
 
 ## Security & privacy
 

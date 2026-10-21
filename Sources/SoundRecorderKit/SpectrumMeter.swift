@@ -13,6 +13,21 @@ public final class SpectrumMeter: @unchecked Sendable {
     /// ISO octave centres, matching GraphicEQ.
     public static let centerFrequencies: [Float] = [32, 64, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
 
+    /// Points in the high-resolution analyzer curve. The ten LED bands are an octave
+    /// apart — a level meter, not an analyzer — so the curve re-bins the same FFT onto a
+    /// finer log-frequency axis, which is what makes a spectral shape (a vocal formant, a
+    /// bass note, a cymbal) legible instead of an octave-wide smear.
+    public static let curveResolution = 96
+    /// Display bounds. Detail near the lower bound is limited by the FFT bin spacing.
+    public static let curveLowHz: Float = 25
+    public static let curveHighHz: Float = 20_000
+
+    /// Centre frequency of each curve point, log-spaced across the span above.
+    public static let curveFrequencies: [Float] = (0..<curveResolution).map { i in
+        let t = Float(i) / Float(curveResolution - 1)
+        return curveLowHz * powf(curveHighHz / curveLowHz, t)
+    }
+
     /// The dBFS window the 0…1 level spans. The top is digital full scale, so the LEDs
     /// read as a real record-level meter: an operator can see both how much headroom is
     /// left and when a band is about to clip. (The old scale topped out at −30 dBFS,
@@ -31,8 +46,12 @@ public final class SpectrumMeter: @unchecked Sendable {
     /// against a tone placed exactly on a bin centre (no scalloping loss to confuse it).
     private static let hannNormGainDB: Float = 20 * log10f((8.0 / 3.0).squareRoot())
 
-    private let n = 2048
-    private let half = 1024
+    /// FFT size. 4096 points at 48 kHz puts the bins 11.7 Hz apart, which is what lets
+    /// the analyzer curve separate low notes — at 2048 the whole bass register collapsed
+    /// into two or three bins and drew as one flat plateau. The 85 ms window it implies is
+    /// still short enough that the display tracks a beat.
+    private let n = 4096
+    private let half = 2048
     private let log2n: vDSP_Length
     private let fftSetup: FFTSetup
 
@@ -48,6 +67,8 @@ public final class SpectrumMeter: @unchecked Sendable {
     private struct BandState {
         var levels = [Float](repeating: 0, count: SpectrumMeter.bandCount)
         var peaks = [Float](repeating: 0, count: SpectrumMeter.bandCount)
+        var curve = [Float](repeating: 0, count: SpectrumMeter.curveResolution)
+        var curvePeaks = [Float](repeating: 0, count: SpectrumMeter.curveResolution)
     }
     private let stateLock = OSAllocatedUnfairLock(initialState: BandState())
 
@@ -75,6 +96,12 @@ public final class SpectrumMeter: @unchecked Sendable {
 
     /// Slowly-falling peak-hold per band (0…1) for floating cap segments.
     public func peakLevels() -> [Float] { stateLock.withLock { $0.peaks } }
+
+    /// Smoothed high-resolution spectrum (0…1 per `curveFrequencies` point).
+    public func curve() -> [Float] { stateLock.withLock { $0.curve } }
+
+    /// Slowly-falling peak-hold trace over that curve.
+    public func curvePeaks() -> [Float] { stateLock.withLock { $0.curvePeaks } }
 
     /// Reset to silence (e.g. when a recording stops).
     public func reset() { stateLock.withLock { $0 = BandState() } }
@@ -147,6 +174,46 @@ public final class SpectrumMeter: @unchecked Sendable {
                 state.levels[b] = smoothed
                 // Peak-hold cap: jumps to new peaks, then falls slowly.
                 state.peaks[b] = smoothed > state.peaks[b] ? smoothed : max(smoothed, state.peaks[b] * 0.965)
+            }
+
+            // The same magnitudes re-binned onto the fine log axis for the analyzer
+            // curve. Each point takes the peak over the FFT bins within half a step
+            // either side, so the points tile the axis without gaps: a tone lands at full
+            // height on the point nearest it instead of being averaged away, and the low
+            // end — where several points share one FFT bin — reads as a smooth shoulder
+            // rather than a staircase.
+            let halfStep = powf(Self.curveHighHz / Self.curveLowHz,
+                                0.5 / Float(Self.curveResolution - 1))
+            for i in 0..<Self.curveResolution {
+                let f = Self.curveFrequencies[i]
+                let loBin = max(1, Int((f / halfStep) / binHz))
+                let hiBin = min(half - 1, max(loBin, Int((f * halfStep) / binHz)))
+                var peak: Float = 0
+                if hiBin > loBin {
+                    // The point spans whole bins: take the loudest, so a tone reads full
+                    // height instead of being averaged down by its quiet neighbours.
+                    for k in loBin...hiBin where mags[k] > peak { peak = mags[k] }
+                } else {
+                    // Low end: the log axis is finer than the FFT, and several points fall
+                    // inside one bin. Reading that bin for each of them draws a staircase
+                    // of identical values, so interpolate between neighbours instead.
+                    let position = min(Float(half - 2), max(1, f / binHz))
+                    let base = Int(position)
+                    let fraction = position - Float(base)
+                    peak = mags[base] + (mags[base + 1] - mags[base]) * fraction
+                }
+                let mag = sqrtf(max(0, peak)) * (2.0 / Float(n))
+                let db = 20 * log10f(mag + 1e-9) - Self.hannNormGainDB
+                let level = min(1, max(0, (db - Self.floorDB) / (Self.ceilingDB - Self.floorDB)))
+                // Slightly quicker decay than the LED bands: the curve is read as a
+                // shape, and a slow release smears transients across neighbouring points.
+                let prev = state.curve[i]
+                var smoothed = level > prev ? level : prev * 0.72 + level * 0.28
+                if smoothed < Self.silenceFloor { smoothed = 0 }
+                state.curve[i] = smoothed
+                state.curvePeaks[i] = smoothed > state.curvePeaks[i]
+                    ? smoothed
+                    : max(smoothed, state.curvePeaks[i] * 0.955)
             }
         }
     }

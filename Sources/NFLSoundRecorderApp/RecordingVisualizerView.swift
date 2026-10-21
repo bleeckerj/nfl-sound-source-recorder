@@ -52,8 +52,12 @@ private struct MeterDisplay: View {
         switch mode {
         case .bars:
             LEDSpectrumView(levels: meters.bandLevels, peaks: meters.bandPeaks)
+        case .spectrum:
+            SpectrumAnalyzerView(curve: meters.spectrumCurve, peaks: meters.spectrumPeaks)
         case .scope:
-            LissajousScopeView(left: meters.scopeLeft, right: meters.scopeRight)
+            LissajousScopeView(left: meters.scopeLeft, right: meters.scopeRight,
+                               correlation: meters.scopeCorrelation,
+                               isMono: meters.scopeIsMono)
         }
     }
 }
@@ -206,45 +210,238 @@ struct DeckButton: View {
     }
 }
 
-// MARK: - Oscilloscope
+// MARK: - Spectrum analyzer
 
-/// Stereo X/Y oscilloscope: the left channel drives X and the right channel drives Y,
-/// producing the geometric figure made by two simultaneous signals. A mono signal
-/// naturally collapses toward the diagonal, while phase and stereo relationships draw
-/// the characteristic ellipses, loops, and more complex Lissajous figures.
+/// Continuous spectrum analyzer: the same FFT that drives the LED bands, re-binned onto a
+/// fine log-frequency axis and drawn as a filled curve with a falling peak-hold trace.
 ///
-/// Built from retained `Shape`s rather than a `Canvas`. `Canvas` was the original
-/// implementation and drew nothing here: it is an immediate-mode surface that only
-/// repaints when its host gives it a display pass, and the `MenuBarExtra(.window)`
-/// popover this panel lives in does not reliably do that. It was also the *only*
-/// `Canvas` in the app, which is why the scope was the only meter that stayed blank
-/// while the LED bars beside it — plain `Shape`s — animated normally.
+/// The ten LED bands next door are a *level* meter — an octave wide each, so a vocal, a
+/// bass line and a cymbal all land in one column and the shape of the sound is lost. This
+/// is the analyzer: 96 points from 25 Hz to 20 kHz, enough to see where the energy
+/// actually sits, and it reads identically whether the capture is mono or stereo.
+///
+/// Built from retained `Shape`s, not `Canvas`: `MenuBarExtra(.window)` does not reliably
+/// give a `Canvas` a display pass, so one here would simply never repaint.
+struct SpectrumAnalyzerView: View {
+    let curve: [Float]
+    let peaks: [Float]
+
+    private let green = Color(red: 0.25, green: 1.0, blue: 0.45)
+    private let cyan = Color(red: 0.15, green: 0.85, blue: 1.0)
+
+    /// Decade gridlines, positioned on the same log axis as the curve.
+    private static let gridlines: [(hz: Float, label: String)] = [
+        (50, "50"), (100, "100"), (500, "500"), (1_000, "1k"),
+        (5_000, "5k"), (10_000, "10k"),
+    ]
+
+    var body: some View {
+        ZStack {
+            SpectrumGrid(frequencies: Self.gridlines.map(\.hz))
+                .stroke(Color.white.opacity(0.09), lineWidth: 0.5)
+
+            // Filled body: bright at the top of the curve, fading into the floor, so
+            // level reads as brightness as well as height.
+            SpectrumCurve(values: curve, closed: true)
+                .fill(LinearGradient(colors: [green.opacity(0.55), cyan.opacity(0.10)],
+                                     startPoint: .top, endPoint: .bottom))
+            SpectrumCurve(values: curve, closed: false)
+                .stroke(green.opacity(0.95), lineWidth: 1.2)
+            // Peak hold: where each point has been recently, falling slowly back.
+            SpectrumCurve(values: peaks, closed: false)
+                .stroke(cyan.opacity(0.55), lineWidth: 0.8)
+
+            SpectrumScaleLabels(gridlines: Self.gridlines)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 140)
+        .background(Color.black)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Where a frequency sits across the width, 0…1 on the analyzer's log axis.
+private func spectrumX(_ hz: Float) -> CGFloat {
+    let lo = SpectrumMeter.curveLowHz, hi = SpectrumMeter.curveHighHz
+    return CGFloat(log(hz / lo) / log(hi / lo))
+}
+
+/// Vertical decade lines plus the −20/−40 dB horizontals of the meter window.
+private struct SpectrumGrid: Shape {
+    let frequencies: [Float]
+
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        for hz in frequencies {
+            let x = rect.minX + spectrumX(hz) * rect.width
+            p.move(to: CGPoint(x: x, y: rect.minY))
+            p.addLine(to: CGPoint(x: x, y: rect.maxY))
+        }
+        // The level scale is linear in dB (−60…0), so thirds are −20 and −40 dBFS.
+        for fraction in [1.0 / 3.0, 2.0 / 3.0] {
+            let y = rect.minY + rect.height * fraction
+            p.move(to: CGPoint(x: rect.minX, y: y))
+            p.addLine(to: CGPoint(x: rect.maxX, y: y))
+        }
+        return p
+    }
+}
+
+/// The curve itself. `closed` returns the area under it (for the gradient fill); open
+/// returns just the line, so the same geometry serves the fill, the stroke and the peaks.
+private struct SpectrumCurve: Shape {
+    let values: [Float]
+    let closed: Bool
+
+    func path(in rect: CGRect) -> Path {
+        var p = Path()
+        let n = values.count
+        guard n > 1 else { return p }
+        func point(_ i: Int) -> CGPoint {
+            let x = rect.minX + rect.width * CGFloat(i) / CGFloat(n - 1)
+            let y = rect.maxY - rect.height * CGFloat(max(0, min(1, values[i])))
+            return CGPoint(x: x, y: y)
+        }
+        p.move(to: point(0))
+        // Smooth the polyline with midpoint quadratics: at 96 points across ~300 pt the
+        // raw line is visibly faceted, and a spectrum is a continuous shape.
+        for i in 1..<n {
+            let previous = point(i - 1), current = point(i)
+            let mid = CGPoint(x: (previous.x + current.x) / 2, y: (previous.y + current.y) / 2)
+            p.addQuadCurve(to: mid, control: previous)
+        }
+        p.addLine(to: point(n - 1))
+        if closed {
+            p.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+            p.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+            p.closeSubpath()
+        }
+        return p
+    }
+}
+
+/// Frequency ticks along the bottom and the dBFS ceiling/floor markers.
+private struct SpectrumScaleLabels: View {
+    let gridlines: [(hz: Float, label: String)]
+
+    var body: some View {
+        GeometryReader { geo in
+            ForEach(gridlines, id: \.hz) { line in
+                Text(line.label)
+                    .font(.system(size: 7, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.35))
+                    .position(x: spectrumX(line.hz) * geo.size.width,
+                              y: geo.size.height - 7)
+            }
+            Text("0 dB")
+                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.28))
+                .position(x: 16, y: 8)
+            Text("−60")
+                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.28))
+                .position(x: 14, y: geo.size.height - 20)
+        }
+    }
+}
+
+// MARK: - Vectorscope
+
+/// Stereo vectorscope in the standard goniometer orientation: the *mid* signal (L+R)
+/// drives the vertical axis and the *side* signal (L−R) the horizontal — the raw L/R
+/// Lissajous, rotated 45° the way every hardware phase meter draws it.
+///
+/// The rotation is what makes the figure readable. In raw L/R orientation a diagonal
+/// line means "left equals right", but so does a right channel that was never read
+/// correctly, and the display gives no way to tell those apart — it just looks broken.
+/// Rotated, mono stands up as a vertical line on the centre axis, out-of-phase material
+/// lies flat along the horizontal, hard-panned sound sits on the L or R diagonal, and a
+/// genuine stereo image opens into the familiar fan. The correlation readout and the
+/// MONO badge say in words what the figure is showing, so a legitimately straight line
+/// reads as information about the source rather than a dead display.
+///
+/// When the capture really is mono — both channels bit-identical, whether because the
+/// material is mono, the output device is summing, or a headset has dropped into a mono
+/// call profile — there is no stereo image to draw at all, and any honest L/R plot is a
+/// single motionless line. The display then switches to plotting the signal against a
+/// delayed copy of itself (`ScopeTrace.phaseSpace`): still a genuine Lissajous figure,
+/// still derived from nothing but the audio, and it moves with the music instead of
+/// sitting there looking broken.
 struct LissajousScopeView: View {
     let left: [Float]
     let right: [Float]
+    /// +1 = channels identical/in phase, 0 = uncorrelated, −1 = inverted.
+    let correlation: Float
+    /// The capture is handing us bit-identical channels — a mono source.
+    let isMono: Bool
 
     private let green = Color(red: 0.25, green: 1.0, blue: 0.45)
     private let cyan = Color(red: 0.15, green: 0.85, blue: 1.0)
 
     var body: some View {
         ZStack {
-            // Oscilloscope graticule: center axes, quarter divisions, and a circular
-            // plotting boundary make the X/Y relationship legible without labels.
+            // Graticule: unit circle, half-scale circle, the M (vertical) and S
+            // (horizontal) axes, and the ±45° L/R panning diagonals.
             ScopeGraticule()
                 .stroke(Color.white.opacity(0.10), lineWidth: 1)
 
             // Layered strokes: cyan halo -> green mid -> bright green core (phosphor look).
-            ScopeTrace(left: left, right: right)
+            ScopeTrace(left: left, right: right, phaseSpace: isMono)
                 .stroke(cyan.opacity(0.18), lineWidth: 5)
-            ScopeTrace(left: left, right: right)
+            ScopeTrace(left: left, right: right, phaseSpace: isMono)
                 .stroke(green.opacity(0.40), lineWidth: 2.2)
-            ScopeTrace(left: left, right: right)
+            ScopeTrace(left: left, right: right, phaseSpace: isMono)
                 .stroke(green.opacity(0.95), lineWidth: 1)
+
+            // The L/R diagonals only mean anything in the stereo projection.
+            if !isMono { ScopeAxisLabels() }
+
+            // Readout. The correlation number is the same fact the figure shows, in a
+            // form you can read off a still frame.
+            VStack {
+                HStack {
+                    Text(isMono ? "MONO" : "STEREO")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .foregroundStyle(isMono ? Color.orange.opacity(0.9) : green.opacity(0.75))
+                    Spacer()
+                    Text(String(format: "CORR %+.2f", correlation))
+                        .font(.system(size: 8, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+                Spacer()
+                Text(isMono ? "phase space — signal × 0.7 ms delay"
+                            : "goniometer — mid × side")
+                    .font(.system(size: 8, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.32))
+            }
+            .padding(6)
         }
         .frame(maxWidth: .infinity)
         .frame(height: 140)
         .background(Color.black)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+/// Corner labels for the two panning diagonals. Text can't live inside a `Shape`, so the
+/// graticule's geometry is mirrored here in the same 0.43-of-the-short-side units.
+private struct ScopeAxisLabels: View {
+    var body: some View {
+        GeometryReader { geo in
+            let r = min(geo.size.width, geo.size.height) * 0.43
+            let c = CGPoint(x: geo.size.width / 2, y: geo.size.height / 2)
+            let off = r * 0.78
+            Group {
+                label("L").position(x: c.x - off, y: c.y - off)
+                label("R").position(x: c.x + off, y: c.y - off)
+            }
+        }
+    }
+
+    private func label(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 8, weight: .semibold, design: .monospaced))
+            .foregroundStyle(.white.opacity(0.28))
     }
 }
 
@@ -259,27 +456,34 @@ private struct ScopeGraticule: Shape {
                                 width: radius * 2, height: radius * 2))
         p.addEllipse(in: CGRect(x: center.x - radius * 0.5, y: center.y - radius * 0.5,
                                 width: radius, height: radius))
+        // M (vertical) and S (horizontal) axes.
         p.move(to: CGPoint(x: center.x - radius, y: center.y))
         p.addLine(to: CGPoint(x: center.x + radius, y: center.y))
         p.move(to: CGPoint(x: center.x, y: center.y - radius))
         p.addLine(to: CGPoint(x: center.x, y: center.y + radius))
-        for fraction: CGFloat in [-0.5, 0.5] {
-            let x = center.x + radius * fraction
-            let y = center.y + radius * fraction
-            p.move(to: CGPoint(x: x, y: center.y - 3))
-            p.addLine(to: CGPoint(x: x, y: center.y + 3))
-            p.move(to: CGPoint(x: center.x - 3, y: y))
-            p.addLine(to: CGPoint(x: center.x + 3, y: y))
-        }
+        // The L and R panning diagonals: a hard-panned channel rides one of these.
+        let d = radius * 0.7071
+        p.move(to: CGPoint(x: center.x - d, y: center.y - d))
+        p.addLine(to: CGPoint(x: center.x + d, y: center.y + d))
+        p.move(to: CGPoint(x: center.x + d, y: center.y - d))
+        p.addLine(to: CGPoint(x: center.x - d, y: center.y + d))
         return p
     }
 }
 
-/// The live trace: successive (left, right) sample pairs joined into a single path, which
-/// is what turns a pile of samples into the figure rather than a scatter of dots.
+/// The live trace: successive sample pairs joined into a single path, which is what turns
+/// a pile of samples into a figure rather than a scatter of dots.
 private struct ScopeTrace: Shape {
     let left: [Float]
     let right: [Float]
+    /// Draw the mono fallback (see `LissajousScopeView`): the signal against a delayed
+    /// copy of itself, rather than left against right.
+    let phaseSpace: Bool
+
+    /// Delay for that fallback: ~0.7 ms at 48 kHz, a quarter cycle of 375 Hz. Around the
+    /// band where most program material sits, so the figure opens out instead of
+    /// collapsing back onto the diagonal the way a very short or very long delay does.
+    private static let lagSamples = 32
 
     func path(in rect: CGRect) -> Path {
         var p = Path()
@@ -288,20 +492,42 @@ private struct ScopeTrace: Shape {
         let center = CGPoint(x: rect.midX, y: rect.midY)
         let radius = min(rect.width, rect.height) * 0.43
 
-        // Auto-scale the current window while preserving the left/right amplitude
-        // relationship, so a quiet passage still draws a full-size figure instead of a
-        // dot at the origin. Below the floor there is nothing meaningful to draw.
         var peak: Float = 0
         for i in 0..<n {
             peak = max(peak, max(abs(left[i]), abs(right[i])))
         }
         guard peak > 0.0002 else { return p }
-        let scale = radius / CGFloat(peak)
+        // Auto-scale the window so a quiet passage still draws a usable figure, but stop
+        // boosting below ≈ −24 dBFS: without that floor a −70 dB noise floor gets
+        // magnified to full screen and near-silence looks like a signal.
+        let reference = max(peak, 0.06)
 
-        // X is left; Y is right, with screen Y inverted for Cartesian orientation.
+        if phaseSpace {
+            // Mono: there is no second channel to plot against, so plot the signal
+            // against itself delayed. A steady tone traces an ellipse — a true Lissajous
+            // figure — and program material draws an evolving one, where left-against-
+            // right can only ever draw the same motionless line.
+            let lag = Self.lagSamples
+            guard n > lag + 1 else { return p }
+            // Divisor leaves room for the diagonal: x and y both reach `reference`, so an
+            // unscaled figure would run past the top of the frame at 45°.
+            let scale = radius / (1.3 * CGFloat(reference))
+            for i in lag..<n {
+                let x = center.x + CGFloat(left[i]) * scale
+                let y = center.y - CGFloat(left[i - lag]) * scale
+                if i == lag { p.move(to: CGPoint(x: x, y: y)) }
+                else { p.addLine(to: CGPoint(x: x, y: y)) }
+            }
+            return p
+        }
+
+        let scale = radius / CGFloat(reference)
+
         for i in 0..<n {
-            let x = center.x + CGFloat(left[i]) * scale
-            let y = center.y - CGFloat(right[i]) * scale
+            let point = StereoScope.goniometer(left: left[i], right: right[i])
+            // Screen Y is inverted, so mid (L+R) grows upward.
+            let x = center.x + CGFloat(point.x) * scale
+            let y = center.y - CGFloat(point.y) * scale
             if i == 0 { p.move(to: CGPoint(x: x, y: y)) }
             else { p.addLine(to: CGPoint(x: x, y: y)) }
         }

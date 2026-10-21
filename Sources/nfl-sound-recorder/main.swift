@@ -58,6 +58,12 @@ func printUsage() {
                         enabling it can add a brief level ramp at the start.
       --warmup <sec>    Skip Core Audio's device-start volume ramp by holding off file
                         writing this long (default 0.6). Use 0 to keep the raw ramp.
+      --selftest-eq     Check EQ response with generated tones; no audio capture.
+      --selftest-spectrum Check spectrum calibration with generated tones.
+      --selftest-scope  Check stereo buffers, correlation, and scope orientation.
+      --probe-stereo    Inspect live tap buffers for --app, --pid, or --system.
+                        Uses existing audio-capture consent and does not route audio.
+      --seconds <sec>   Length of --probe-stereo (default 3).
 
     Press Ctrl-C to stop recording.
     """)
@@ -352,6 +358,36 @@ func runScopeSelfTest() {
                  niPeakR, niCorr,
                  (niPeakR > 0.0002 && abs(niCorr) < 0.2) ? "✓ PASS" : "✗ FAIL (R channel misread)"))
 
+    // Goniometer orientation: mid (L+R) is vertical and side (R−L) is horizontal.
+    // Check the mono, inverted, and panned signals against their expected axes.
+    let orientations: [(String, (Float) -> (Float, Float), String)] = [
+        ("mono (R = L)",        { ($0, $0) },        "vertical line   (x = 0)"),
+        ("inverted (R = −L)",   { ($0, -$0) },       "horizontal line (y = 0)"),
+        ("hard left (R = 0)",   { ($0, 0) },         "L diagonal, up-left"),
+        ("hard right (L = 0)",  { (0, $0) },         "R diagonal, up-right"),
+    ]
+    print("\nGoniometer orientation")
+    for (label, pair, expected) in orientations {
+        var maxX: Float = 0, maxY: Float = 0, maxDiag: Float = 0, maxAnti: Float = 0
+        for step in 0..<256 {
+            let v = Float(sin(Double(step) / 256 * 2 * Double.pi)) * 0.8
+            let (l, r) = pair(v)
+            let p = StereoScope.goniometer(left: l, right: r)
+            maxX = max(maxX, abs(p.x)); maxY = max(maxY, abs(p.y))
+            maxDiag = max(maxDiag, abs(p.x - p.y)); maxAnti = max(maxAnti, abs(p.x + p.y))
+        }
+        let onAxis: Float
+        switch label {
+        case "mono (R = L)":       onAxis = maxX
+        case "inverted (R = −L)":  onAxis = maxY
+        // Up-left means x and y have opposite signs; up-right, the same sign.
+        case "hard left (R = 0)":  onAxis = maxAnti
+        default:                   onAxis = maxDiag
+        }
+        print(String(format: "  %-20@ → %@  %@", label as NSString, expected as NSString,
+                     (onAxis < 1e-6 && max(maxX, maxY) > 0.01) ? "✓ PASS" : "✗ FAIL"))
+    }
+
     // Continuity: consecutive samples must be adjacent in time, or the path drawn through
     // them zig-zags across the screen instead of tracing the figure.
     let scope = StereoScope()
@@ -396,6 +432,50 @@ func meterBar(_ peak: Float, width: Int = 24) -> String {
 
 // MARK: - Main
 
+/// Inspect the live tap's buffer layout and largest observed |L − R|. Identical
+/// channels can come from a mono source or a stereo buffer being read incorrectly.
+///
+/// Runs without asking for the audio-capture consent: unauthorized taps deliver silence,
+/// but the buffer *layout* is still real, so the shape question is answerable either way.
+func runStereoProbe(target: ProcessTapRecorder.Target, seconds: Double) {
+    let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("tapdeck-probe-\(UUID().uuidString).caf")
+    defer { try? FileManager.default.removeItem(at: tmp) }
+    let recorder = ProcessTapRecorder(source: .tap(target), outputDevice: nil, fileURL: tmp,
+                                      format: .caf, mute: false, warmupSeconds: 0)
+    print("Audio-capture permission: \(AudioCapturePermission.status().rawValue)")
+    do {
+        try recorder.start()
+    } catch {
+        print("Could not start the tap: \(error)")
+        return
+    }
+    print("Declared capture format: \(recorder.captureDescription ?? "unknown")")
+    Thread.sleep(forTimeInterval: seconds)
+
+    let layout = recorder.scope.layout()
+    let s = recorder.scope.snapshot()
+    recorder.stop()
+
+    let peakL = s.left.map(abs).max() ?? 0
+    let peakR = s.right.map(abs).max() ?? 0
+    print("Delivered buffers:       \(layout.summary)")
+    print(String(format: "Frames seen:             %llu", layout.frames))
+    print(String(format: "Window peak L %.5f  R %.5f", peakL, peakR))
+    if layout.frames == 0 {
+        print("\nNo frames arrived — the IOProc never ran.")
+    } else if peakL == 0 && peakR == 0 {
+        print("\nSilence: either nothing is playing, or the tap is unauthorized (see the")
+        print("permission line above). The buffer shape printed above is still real.")
+    } else if layout.isMonoSource {
+        print("\nThe two channels are bit-identical: the tap is handing us a mono signal")
+        print("duplicated across both channels. Scope labels this MONO and plots the")
+        print("signal against a delayed copy. That display does not create stereo audio.")
+    } else {
+        print("\nGenuine stereo: the channels differ, so the scope has a figure to draw.")
+    }
+}
+
 if hasFlag("--help") || hasFlag("-h") || CommandLine.arguments.count == 1 {
     printUsage()
     exit(0)
@@ -424,6 +504,15 @@ if hasFlag("--selftest-spectrum") {
 
 if hasFlag("--selftest-scope") {
     runScopeSelfTest()
+    exit(0)
+}
+
+if hasFlag("--probe-stereo") {
+    guard let target = resolveTarget() else {
+        FileHandle.standardError.write("--probe-stereo needs a tap target: --app <bundle id>, --pid <n>, or --system.\n".data(using: .utf8)!)
+        exit(1)
+    }
+    runStereoProbe(target: target, seconds: argValue("--seconds").flatMap(Double.init) ?? 3)
     exit(0)
 }
 

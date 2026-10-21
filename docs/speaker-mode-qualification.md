@@ -14,8 +14,14 @@ this recording mode. Echo cancellation adapts during the first few seconds.
 
 Record must be the call app or All System Audio. **None — microphone only** has no
 direct app audio for the echo reference. The controls show a setup warning when
-either source is missing, and Record checks both selections before requesting
-permissions or starting capture. To record only the microphone, turn off Open speakers.
+either source is missing, and REC stays disabled until both selections are valid.
+The app validates the selections ahead of permission requests. It repeats
+validation when a permission prompt closes. The shared recorder rejects an invalid
+source before opening audio devices or creating recording files. To record only
+the microphone, turn off Open speakers.
+
+When setup is invalid, its warning replaces the general echo-cancellation hint.
+Selecting an app/system source and microphone removes the warning and enables REC.
 
 CLI example:
 
@@ -83,6 +89,16 @@ It does not establish live-call performance. External speakers, USB microphones
 and Bluetooth devices are outside this first version's supported setup.
 
 ## Repeat the bounded check
+
+Source-selection checks run without audio capture:
+
+```sh
+swift test --filter SpeakerModeConfigurationTests
+```
+
+The two regression tests cover all combinations of app audio and microphone
+availability, then exercise rejected recorder starts with an invalid device ID.
+They check the error type and confirm that no recording folder is created.
 
 Build a signed diagnostic without replacing the installed app:
 
