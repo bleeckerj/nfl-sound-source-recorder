@@ -597,7 +597,7 @@ final class RecordingController: ObservableObject {
                 meters.scopeLeft = s.left
                 meters.scopeRight = s.right
                 meters.scopeCorrelation = StereoScope.correlation(left: s.left, right: s.right)
-                meters.scopeIsMono = recorder.scope.layout().isMonoSource
+                meters.scopeIsMono = meters.scopeClassifier.update(left: s.left, right: s.right)
             }
         }
         // Smoothed live level (0...1) for the menu-bar icon's hub swell: map the

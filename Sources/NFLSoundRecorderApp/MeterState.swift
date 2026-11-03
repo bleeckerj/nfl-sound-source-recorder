@@ -25,9 +25,9 @@ final class MeterState: ObservableObject {
     @Published var scopeRight: [Float] = []
     /// Channel correlation of the window on screen (+1 mono/in-phase … −1 inverted).
     @Published var scopeCorrelation: Float = 0
-    /// The capture has handed us bit-identical channels for long enough to say so: the
-    /// source really is mono, and no display can draw a stereo figure from it.
+    /// Current audio has little difference between its channels.
     @Published var scopeIsMono = false
+    var scopeClassifier = ScopeSignalClassifier()
     /// Rotation (degrees) for the cassette reels; advances while recording.
     @Published var iconAngle: Double = 0
     /// Smoothed live audio level (0...1) driving the menu-bar icon's hub swell.
@@ -46,6 +46,7 @@ final class MeterState: ObservableObject {
         scopeRight = []
         scopeCorrelation = 0
         scopeIsMono = false
+        scopeClassifier = ScopeSignalClassifier()
         iconLevel = 0
     }
 }

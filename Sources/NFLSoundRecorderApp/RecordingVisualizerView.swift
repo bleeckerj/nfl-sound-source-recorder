@@ -372,7 +372,7 @@ struct LissajousScopeView: View {
     let right: [Float]
     /// +1 = channels identical/in phase, 0 = uncorrelated, −1 = inverted.
     let correlation: Float
-    /// The capture is handing us bit-identical channels — a mono source.
+    /// The recent channels have little difference, so show a delayed-signal plot.
     let isMono: Bool
 
     private let green = Color(red: 0.25, green: 1.0, blue: 0.45)
@@ -396,11 +396,11 @@ struct LissajousScopeView: View {
             // The L/R diagonals only mean anything in the stereo projection.
             if !isMono { ScopeAxisLabels() }
 
-            // Readout. The correlation number is the same fact the figure shows, in a
-            // form you can read off a still frame.
+            // Correlation always describes the captured channels, including in the
+            // delayed-signal view.
             VStack {
                 HStack {
-                    Text(isMono ? "MONO" : "STEREO")
+                    Text(isMono ? "NEAR MONO" : "STEREO")
                         .font(.system(size: 8, weight: .bold, design: .monospaced))
                         .foregroundStyle(isMono ? Color.orange.opacity(0.9) : green.opacity(0.75))
                     Spacer()
@@ -409,7 +409,7 @@ struct LissajousScopeView: View {
                         .foregroundStyle(.white.opacity(0.45))
                 }
                 Spacer()
-                Text(isMono ? "phase space — signal × 0.7 ms delay"
+                Text(isMono ? "phase space — signal × 32-sample delay"
                             : "goniometer — mid × side")
                     .font(.system(size: 8, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.32))
@@ -503,10 +503,8 @@ private struct ScopeTrace: Shape {
         let reference = max(peak, 0.06)
 
         if phaseSpace {
-            // Mono: there is no second channel to plot against, so plot the signal
-            // against itself delayed. A steady tone traces an ellipse — a true Lissajous
-            // figure — and program material draws an evolving one, where left-against-
-            // right can only ever draw the same motionless line.
+            // Near mono: plot the left channel against a delayed copy. A steady tone
+            // traces an ellipse, while program material draws an evolving figure.
             let lag = Self.lagSamples
             guard n > lag + 1 else { return p }
             // Divisor leaves room for the diagonal: x and y both reach `reference`, so an
