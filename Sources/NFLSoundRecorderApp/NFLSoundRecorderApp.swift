@@ -14,6 +14,7 @@ struct NFLSoundRecorderApp: App {
             // taller than a small display can show, which otherwise clips the bottom.
             MenuContentView(controller: controller,
                             maxContentHeight: (NSScreen.main?.visibleFrame.height ?? 760) - 16)
+                .background(Color(nsColor: .windowBackgroundColor).ignoresSafeArea())
         } label: {
             // Its own view observing MeterState: reading the reel angle/level here in the
             // Scene body would re-evaluate the whole scene — and rebuild MenuContentView —
