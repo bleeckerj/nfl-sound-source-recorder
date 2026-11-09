@@ -160,8 +160,9 @@ struct MenuContentView: View {
                     Color.clear.preference(key: PanelHeightKey.self, value: geo.size.height)
                 })
             }
-            .frame(width: 320,
-                   height: min(measuredHeight == 0 ? maxContentHeight : measuredHeight, maxContentHeight))
+            // Starting at the maximum makes the menu-bar host open screen-height
+            // before measurement, and it can retain that oversized window frame.
+            .frame(width: 320, height: min(max(measuredHeight, 1), maxContentHeight))
             .onPreferenceChange(PanelHeightKey.self) { measuredHeight = $0 }
         } else {
             flipCard
