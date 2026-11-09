@@ -101,7 +101,7 @@ final class RecorderSession {
 
     /// Stops the recording and returns the file URL and its duration in seconds.
     @discardableResult
-    func stop() -> (url: URL, duration: TimeInterval, error: String?, sources: URL?)? {
+    func stop() -> (url: URL, duration: TimeInterval, error: String?, speakerMode: Bool)? {
         guard let active else { return nil }
         active.recorder.stop()
         let duration = elapsed ?? Date().timeIntervalSince(active.startDate)
@@ -109,7 +109,7 @@ final class RecorderSession {
         isPaused = false
         pausedAt = nil
         pausedTotal = 0
-        return (active.fileURL, duration, active.recorder.recordingError, active.recorder.sourceFilesURL)
+        return (active.fileURL, duration, active.recorder.recordingError, active.recorder.isSpeakerMode)
     }
 
     struct SessionError: LocalizedError, CustomStringConvertible {

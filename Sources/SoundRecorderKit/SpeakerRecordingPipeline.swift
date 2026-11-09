@@ -3,7 +3,7 @@ import CoreAudio
 import Foundation
 import os
 
-/// Copies timestamped input on device callbacks; runs AEC and source writing on
+/// Copies timestamped input on device callbacks; runs echo cancellation on
 /// one worker. The normal recorder sink receives only the cleaned stereo mix.
 final class SpeakerRecordingPipeline: @unchecked Sendable {
     struct Controls {
@@ -11,30 +11,16 @@ final class SpeakerRecordingPipeline: @unchecked Sendable {
         let microphoneGain: Float
         let sourceGain: Float
     }
-    struct Report: Codable {
-        let backend: String
-        let sampleRate: Int
-        let appAudio: String
-        let rawMicrophone: String
-        let cleanedMicrophone: String
-        let frames: UInt64
-        let completed: Bool
-        let error: String?
-    }
     static let rate = 48_000.0
     private let app = TimestampedAudioRing(channels: 2)
     private let microphone = TimestampedAudioRing(channels: 1)
     private let processor: SpeakerEchoProcessor
-    private let appWriter: AsyncAudioFileWriter
-    private let rawWriter: AsyncAudioFileWriter
-    private let cleanWriter: AsyncAudioFileWriter
-    let directory: URL
+    private let qualificationTracks: SpeakerQualificationTracks?
     private let output: (UnsafeMutableAudioBufferListPointer, Int) -> Void
     private let controls: () -> Controls
     private let queue = DispatchQueue(label: "com.nfl.tapdeck.speaker-processing", qos: .userInitiated)
     private var timer: DispatchSourceTimer?
     private var cursor: Int64?
-    private var frames: UInt64 = 0
     private var stopped = false
     private let errorState = OSAllocatedUnfairLock(initialState: Optional<String>.none)
     var error: String? { errorState.withLock { $0 } }
@@ -52,28 +38,13 @@ final class SpeakerRecordingPipeline: @unchecked Sendable {
         }
     }
 
-    init(fileURL: URL, tapRate: Double, controls: @escaping () -> Controls,
+    init(tapRate: Double, qualificationDirectory: URL? = nil, controls: @escaping () -> Controls,
          output: @escaping (UnsafeMutableAudioBufferListPointer, Int) -> Void) throws {
         self.tapRate = tapRate
         self.controls = controls
         self.output = output
         processor = try SpeakerEchoProcessor()
-        let directory = fileURL.deletingPathExtension().appendingPathExtension("sources")
-        self.directory = directory
-        guard !FileManager.default.fileExists(atPath: directory.path) else {
-            throw CA.Error(status: -1, context: "Speaker source folder already exists: \(directory.path)")
-        }
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        func writer(_ name: String, channels: AVAudioChannelCount) throws -> AsyncAudioFileWriter {
-            let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Self.rate,
-                                       channels: channels, interleaved: true)!
-            return try AsyncAudioFileWriter(fileURL: directory.appendingPathComponent(name),
-                settings: RecordingFormat.caf.settings(sampleRate: Self.rate, channels: channels), captureFormat: format)
-        }
-        appWriter = try writer("app-audio.caf", channels: 2)
-        rawWriter = try writer("microphone-raw.caf", channels: 1)
-        cleanWriter = try writer("microphone-cleaned.caf", channels: 1)
-        try saveReport()
+        qualificationTracks = try qualificationDirectory.map { try SpeakerQualificationTracks(directory: $0) }
     }
 
     deinit { timer?.cancel() }
@@ -98,17 +69,16 @@ final class SpeakerRecordingPipeline: @unchecked Sendable {
             timer?.cancel(); timer = nil
             drain(final: true)
             stopped = true
-            appWriter.finish(); rawWriter.finish(); cleanWriter.finish()
-            for writer in [appWriter, rawWriter, cleanWriter] {
-                if let failure = writer.failure { fail(failure) }
-            }
-            do { try saveReport() } catch { fail("Could not save speaker session: \(error)") }
+            qualificationTracks?.finish()
+            if let failure = qualificationTracks?.failure { fail(failure) }
+            do { try qualificationTracks?.saveReport(stopped: true, error: error) }
+            catch { fail("Could not save speaker session: \(error)") }
         }
     }
     func reportFailure(_ message: String) {
         queue.sync {
             fail(message)
-            do { try saveReport() } catch { fail("Could not update speaker session: \(error)") }
+            do { try qualificationTracks?.saveReport(stopped: stopped, error: error) } catch { fail("Could not update speaker session: \(error)") }
         }
     }
     private func fail(_ message: String) { errorState.withLock { if $0 == nil { $0 = message } } }
@@ -138,17 +108,10 @@ final class SpeakerRecordingPipeline: @unchecked Sendable {
                 mixed[2 * i] = stereo[2 * i] * controls.sourceGain + mic
                 mixed[2 * i + 1] = stereo[2 * i + 1] * controls.sourceGain + mic
             }
-            if controls.save {
-                withBuffer(stereo, channels: 2) { appWriter.enqueue($0, frames: 480) }
-                withBuffer(raw, channels: 1) { rawWriter.enqueue($0, frames: 480) }
-                withBuffer(clean, channels: 1) { cleanWriter.enqueue($0, frames: 480) }
-                frames += 480
-            }
+            if controls.save { qualificationTracks?.append(app: stereo, raw: raw, clean: clean) }
             withBuffer(mixed, channels: 2) { output($0, 480) }
             cursor = position + 480
-            for writer in [appWriter, rawWriter, cleanWriter] {
-                if let failure = writer.failure { fail(failure); return }
-            }
+            if let failure = qualificationTracks?.failure { fail(failure); return }
         }
     }
     private func withBuffer(_ samples: UnsafeMutablePointer<Float>, channels: Int,
@@ -156,12 +119,5 @@ final class SpeakerRecordingPipeline: @unchecked Sendable {
         var buffer = AudioBufferList(mNumberBuffers: 1, mBuffers: AudioBuffer(mNumberChannels: UInt32(channels),
             mDataByteSize: UInt32(480 * channels * 4), mData: samples))
         withUnsafeMutablePointer(to: &buffer) { body(UnsafeMutableAudioBufferListPointer($0)) }
-    }
-    private func saveReport() throws {
-        let report = Report(backend: "WebRTC AudioProcessing 2.1 / AEC3", sampleRate: 48_000,
-            appAudio: "app-audio.caf", rawMicrophone: "microphone-raw.caf",
-            cleanedMicrophone: "microphone-cleaned.caf", frames: frames, completed: stopped && error == nil, error: error)
-        let encoder = JSONEncoder(); encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try encoder.encode(report).write(to: directory.appendingPathComponent("session.json"), options: .atomic)
     }
 }

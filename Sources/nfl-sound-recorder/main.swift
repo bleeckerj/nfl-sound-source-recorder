@@ -39,7 +39,7 @@ func printUsage() {
       --mic-default     Like --mic, using the system default input device.
       --speaker-mode    Cancel speaker echo with local WebRTC processing. Requires app/
                         system audio plus the built-in mic and speakers. Disables routing;
-                        keeps original source tracks beside the mix (~46 MB/min).
+                        saves one recording in the selected format.
       --mic-level <dB>  Microphone feed level in dB (0 = unity, default 0). For balance.
       --source-level <dB> Tap/system feed level in dB (0 = unity, default 0). For balance.
       --out <deviceUID> Output device UID to route to (default: current default output).
@@ -48,7 +48,7 @@ func printUsage() {
       --file <path>     Output file path (default: ./recording-<timestamp>.<ext>).
       --format <fmt>    Recording format: caf, wav, aiff, aac, alac, flac (default: aac).
                         aac is lossy (~1 MB/min, the small default); caf/wav/aiff/alac/flac
-                        are lossless (caf ~90 MB/min). If omitted but --file has a known
+                        are lossless (CAF ~23 MB/min at 48 kHz stereo). If omitted but --file has a known
                         extension, the format is inferred. macOS has no MP3 encoder — use aac.
       --mute            Silence the app's normal output so only the routed copy is heard.
       --eq <g0,..,g9>   Enable the 10-band EQ with per-band gains in dB, low→high
@@ -632,7 +632,6 @@ do {
         print("\n\nStopped. Saved: \(fileURL.path)")
         print("  frames captured: \(recorder.meter.totalFrames)")
         print("  peak level:      \(db)")
-        if let sources = recorder.sourceFilesURL { print("  source tracks:   \(sources.path)") }
         if let error = recorder.recordingError {
             FileHandle.standardError.write("Recording failed; partial files retained: \(error)\n".data(using: .utf8)!)
             exit(1)

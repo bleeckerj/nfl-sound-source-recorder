@@ -24,15 +24,18 @@ final class SpeakerTimelineTests: XCTestCase {
         for i in 0..<960 { XCTAssertEqual(output[i], 0) }
     }
 
-    func testSpeakerSourcesStayAlignedWhenAppIsSilent() throws {
+    func testSpeakerMixWritesOnlyOneAACFileWhenAppIsSilent() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let file = directory.appendingPathComponent("mix.caf")
-        var outputFrames = 0
-        let pipeline = try SpeakerRecordingPipeline(fileURL: file, tapRate: 48_000,
+        let file = directory.appendingPathComponent("mix.m4a")
+        let stereo = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000,
+                                   channels: 2, interleaved: true)!
+        let writer = try AsyncAudioFileWriter(fileURL: file,
+            settings: RecordingFormat.aac.settings(sampleRate: 48_000, channels: 2), captureFormat: stereo)
+        let pipeline = try SpeakerRecordingPipeline(tapRate: 48_000,
             controls: { .init(save: true, microphoneGain: 1, sourceGain: 1) },
-            output: { _, frames in outputFrames += frames })
+            output: { writer.enqueue($0, frames: $1) })
         let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 48_000, channels: 1, interleaved: true)!
         let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 480)!
         buffer.frameLength = 480
@@ -45,12 +48,11 @@ final class SpeakerTimelineTests: XCTestCase {
         }
         pipeline.finish()
         XCTAssertNil(pipeline.error)
-        XCTAssertEqual(outputFrames, 9600)
-        let sources = file.deletingPathExtension().appendingPathExtension("sources")
-        for name in ["app-audio.caf", "microphone-raw.caf", "microphone-cleaned.caf"] {
-            XCTAssertEqual(try AVAudioFile(forReading: sources.appendingPathComponent(name)).length, 9600)
-        }
-        let report = try JSONSerialization.jsonObject(with: Data(contentsOf: sources.appendingPathComponent("session.json"))) as! [String: Any]
-        XCTAssertEqual(report["completed"] as? Bool, true)
+        writer.finish()
+        XCTAssertNil(writer.failure)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: directory.path), ["mix.m4a"])
+        let audio = try AVAudioFile(forReading: file)
+        XCTAssertEqual(audio.fileFormat.settings[AVFormatIDKey] as? UInt32, kAudioFormatMPEG4AAC)
+        XCTAssertGreaterThanOrEqual(audio.length, 9600)
     }
 }

@@ -106,7 +106,6 @@ final class RecordingController: ObservableObject {
     @Published var vizMode: VizMode = .spectrum
     @Published var lastError: String?
     @Published var lastFileURL: URL?
-    @Published var lastSourceFilesURL: URL?
 
     /// Everything the 30 Hz tick rewrites — meters, reels, elapsed clock. A separate
     /// object (not `@Published` here, so mutating it never invalidates the panel) observed
@@ -387,7 +386,6 @@ final class RecordingController: ObservableObject {
         let gen = lifecycleGeneration
         recordingSourceLabel = sourceLabel
         lastFileURL = url
-        lastSourceFilesURL = rec.sourceFilesURL
         startDate = nil          // set on confirmation so the elapsed clock starts at 0
         pausedAt = nil; pausedTotal = 0; isPaused = false
         meters.elapsedText = "00:00"
@@ -571,7 +569,7 @@ final class RecordingController: ObservableObject {
 
     func revealLastFile() {
         guard let url = lastFileURL else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([url] + (lastSourceFilesURL.map { [$0] } ?? []))
+        NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
     /// Publishes a meter frame. Every write lands on `meters`, never on `self`, so a frame

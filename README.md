@@ -93,9 +93,8 @@ cannot supply that reference. If app audio or the microphone is missing, the
 controls show setup guidance and disable REC. To record only the microphone,
 turn off Open speakers.
 
-TapDeck saves the mix and a neighboring `.sources` folder containing direct app
-audio, raw microphone audio, cleaned microphone audio, and `session.json`.
-These source tracks use approximately **46 MB/min**, in addition to the mix.
+TapDeck saves one finished recording in the selected format. Choose AAC (.m4a)
+for smaller files.
 
 See [speaker recording setup and qualification](docs/speaker-mode-qualification.md)
 for supported devices, timing, diagnostic commands, and the limits of the
@@ -183,8 +182,8 @@ A typical LLM flow: call `list_applications` and `list_output_devices` to see wh
 For speaker echo cancellation, pass `speaker_mode: true` with an app/system source
 and the built-in microphone. The default microphone must be built in when using
 `microphone: "default"`. This mode records without routing and rejects muting the
-original output. Recording status and stop results include `speakerMode`,
-`sourceFiles`, and any recording error.
+original output. Recording status and stop results include `speakerMode`
+and any recording error.
 
 The MCP executable is a separate front end to the shared recorder engine. A recording started through MCP is controlled through that MCP session; a recording started from the menu-bar app is not automatically attached to it.
 

@@ -180,7 +180,7 @@ final class MCPServer {
         case "stop_recording":
             if let stopped = session.stop() {
                 return (Self.json(["stopped": true, "file": stopped.url.path, "durationSeconds": Int(stopped.duration),
-                                   "error": stopped.error ?? "", "sourceFiles": stopped.sources?.path ?? "", "speakerMode": stopped.sources != nil]), stopped.error != nil)
+                                   "error": stopped.error ?? "", "speakerMode": stopped.speakerMode]), stopped.error != nil)
             }
             return ("Not currently recording.", true)
 
@@ -189,7 +189,6 @@ final class MCPServer {
                 return (Self.json([
                     "isRecording": session.isRecording, "source": active.sourceLabel, "device": active.deviceName,
                     "speakerMode": active.recorder.isSpeakerMode, "error": active.recorder.recordingError ?? "",
-                    "sourceFiles": active.recorder.sourceFilesURL?.path ?? "",
                     "file": active.fileURL.path, "elapsedSeconds": Int(session.elapsed ?? 0),
                     "paused": session.isPaused,
                     "framesCaptured": Int(active.recorder.meter.totalFrames),
@@ -302,7 +301,7 @@ final class MCPServer {
             return (Self.json([
                 "started": true, "source": label, "device": device?.name ?? "(record only)", "mute": mute,
                 "driftCompensation": driftCompensation, "format": format.rawValue, "file": fileURL.path,
-                "speakerMode": speakerMode, "sourceFiles": session.active?.recorder.sourceFilesURL?.path ?? "",
+                "speakerMode": speakerMode,
             ]), false)
         } catch {
             return ("Failed to start recording: \(error)", true)
@@ -359,11 +358,11 @@ final class MCPServer {
                     "source_level_db": ["type": "number", "description": "Tap/system feed level in dB (0 = unity). Use with mic_level_db to balance a mix."],
                     "mic_level_db": ["type": "number", "description": "Microphone feed level in dB (0 = unity). Use with source_level_db to balance a mix."],
                     "output_uid": stringProp("UID of the output device from list_output_devices, or 'none' to record only (no routing). Defaults to the current default output. Tip: with a microphone, prefer 'none' or headphones to avoid feedback."),
-                    "speaker_mode": ["type": "boolean", "description": "Enable local WebRTC speaker echo cancellation. Requires app/system audio, microphone 'default' or a built-in microphone UID, and built-in speakers. Uses record-only routing and keeps original source tracks beside the mix (about 46 MB/min). Default false."],
+                    "speaker_mode": ["type": "boolean", "description": "Enable local WebRTC speaker echo cancellation. Requires app/system audio, microphone 'default' or a built-in microphone UID, and built-in speakers. Uses record-only routing and saves one recording in the selected format. Default false."],
                     "mute": ["type": "boolean", "description": "If true, mute the source's normal output so only the routed copy is heard (reroute). Default false."],
                     "drift_compensation": ["type": "boolean", "description": "Resample the tap to the output clock. Default false; enabling can add a brief level ramp at the start."],
                     "warmup_seconds": ["type": "number", "description": "Hold off file-writing this long to skip Core Audio's device-start volume ramp. Default 0.6; use 0 to keep the raw ramp."],
-                    "format": stringProp("Output codec: aac (default, ~1 MB/min, lossy), or lossless caf/wav/aiff/alac/flac (caf ~90 MB/min). macOS has no MP3 encoder — use aac."),
+                    "format": stringProp("Output codec: aac (default, ~1 MB/min, lossy), or lossless caf/wav/aiff/alac/flac (CAF ~23 MB/min at 48 kHz stereo). macOS has no MP3 encoder — use aac."),
                     "file_path": stringProp("Optional filename for the recording. Only the filename is used (its extension is replaced to match the format); writes are confined to ~/Music/TapDeck/."),
                 ],
                 "additionalProperties": false,

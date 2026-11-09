@@ -18,7 +18,7 @@ struct SpeakerModeControls: View {
                     Text("TapDeck uses the selected app audio as the echo reference. Use the built-in Mac speakers and microphone. Echo cancellation adapts over the first few seconds.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                Text("Original app and microphone tracks are kept beside the mix (about 46 MB/min).")
+                Text("Saves one recording in the selected format.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

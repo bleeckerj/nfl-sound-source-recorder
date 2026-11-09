@@ -33,18 +33,12 @@ CLI example:
 MCP `start_recording` accepts `speaker_mode: true` with a call app or system
 source and `microphone: "default"` or the built-in microphone UID. Output defaults
 to record-only in this mode. Explicit routing or muting requests are rejected.
-Status and stop results include `speakerMode`, `sourceFiles`, and any error.
+Status and stop results include `speakerMode` and any recording error.
 
-For a mix named `meeting.m4a`, `meeting.sources/` contains:
-
-- `app-audio.caf`: direct stereo app audio at 48 kHz.
-- `microphone-raw.caf`: microphone audio before echo cancellation, mono at 48 kHz.
-- `microphone-cleaned.caf`: the processed microphone, mono at 48 kHz.
-- `session.json`: backend, format, source filenames, frame count, completion and errors.
-
-The mix uses direct app audio plus the cleaned microphone. Per-feed gains and EQ
-apply to the mix; source tracks retain their original levels. Source tracks use
-Float32 PCM, approximately 46 MB/min in total, in addition to the mix.
+Speaker mode saves one mix in the selected format. AAC (.m4a) is the default
+and uses about 1 MB/min. The mix combines direct app audio with the cleaned
+microphone. The dedicated qualification command saves separate CAF tracks
+for measurement; normal recordings have no companion source folder.
 
 ## Timing and failure handling
 
@@ -52,12 +46,11 @@ Device callbacks copy PCM into bounded, timestamped buffers. Both feeds are
 resampled onto a shared 48 kHz host-time timeline, correcting independent clock
 rates without allowing drift to accumulate. One worker processes 10 ms blocks
 with 40 ms of input buffering. The microphone advances the timeline when the app
-is silent. The processor continues adapting during warmup and pauses; all files
-share the same saving decision.
+is silent. The processor continues adapting during warmup and pauses.
 
 A device change, missing microphone timeline, processing error or file-writer
 failure stops and finalizes the recording. The reason remains available to every
-front end and in the session JSON. The engine never substitutes raw app-plus-mic
+front end. The qualification command also saves errors in its session JSON. The engine never substitutes raw app-plus-mic
 mixing after an echo-cancellation failure. Existing destinations are preserved.
 
 DSP code is optimized in debug builds as well as release builds. The initial

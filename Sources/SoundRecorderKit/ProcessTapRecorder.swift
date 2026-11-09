@@ -80,9 +80,7 @@ public final class ProcessTapRecorder: @unchecked Sendable {
     public var recordingError: String? {
         finalError.withLock { $0 }
     }
-    public var sourceFilesURL: URL? {
-        speakerMode ? fileURL.deletingPathExtension().appendingPathExtension("sources") : nil
-    }
+    var speakerQualificationDirectory: URL?
 
     /// 10-band EQ applied to both the routed output and the recorded file.
     /// Control it live (e.g. from the UI) via `setGain`/`setEnabled`.
@@ -200,10 +198,8 @@ public final class ProcessTapRecorder: @unchecked Sendable {
                     hasAppAudio: source.tapTarget != nil, hasMicrophone: source.micDevice != nil) {
                     throw error
                 }
-                for path in [fileURL, sourceFilesURL!] {
-                    guard !FileManager.default.fileExists(atPath: path.path) else {
-                        throw CA.Error(status: -1, context: "Speaker recording destination already exists: \(path.path)")
-                    }
+                guard !FileManager.default.fileExists(atPath: fileURL.path) else {
+                    throw CA.Error(status: -1, context: "Speaker recording destination already exists: \(fileURL.path)")
                 }
                 if let mic = source.micDevice {
                     try SpeakerRecordingPipeline.validate(microphone: mic, output: routingDevice, mute: mute)
@@ -229,7 +225,7 @@ public final class ProcessTapRecorder: @unchecked Sendable {
                     let appGain = sourceGainLock, meter = self.meter
                     let warmup = UInt64(warmupSeconds * 48_000)
                     let failure = finalError, writer = self.writer
-                    speakerPipeline = try SpeakerRecordingPipeline(fileURL: fileURL, tapRate: tapRate, controls: {
+                    speakerPipeline = try SpeakerRecordingPipeline(tapRate: tapRate, qualificationDirectory: speakerQualificationDirectory, controls: {
                         let enabled = meter.totalFrames + 480 >= warmup && !paused.withLock { $0 }
                             && failure.withLock { $0 == nil } && writer?.failure == nil
                         save.withLock { $0 = enabled }

@@ -12,7 +12,7 @@ import CoreAudioTypes
 /// deliberately absent. `.aac` is the native small-file equivalent; true MP3 would
 /// require bundling a third-party encoder (LAME) or an ffmpeg post-encode step.
 public enum RecordingFormat: String, CaseIterable, Sendable {
-    /// Float32 linear PCM in an Apple CAF container. Lossless, largest files (~90 MB/min),
+    /// Float32 linear PCM in an Apple CAF container. Lossless, largest files (~23 MB/min at 48 kHz stereo),
     /// no 4 GB size limit. The closest thing to the raw tap samples; use when you need
     /// lossless. (Was the original default before `.aac` took over — see the enum note.)
     case caf
@@ -108,8 +108,7 @@ public enum RecordingFormat: String, CaseIterable, Sendable {
                 AVFormatIDKey: kAudioFormatMPEG4AAC,
                 AVSampleRateKey: sampleRate,
                 AVNumberOfChannelsKey: channels,
-                // 128 kbps: transparent for spoken voice, ~1 MB/min — roughly 90× smaller
-                // than Float32 CAF. The default; short conversations shouldn't be lossless.
+                // 128 kbps uses about 1 MB/min for the default AAC recording.
                 AVEncoderBitRateKey: 128_000,
                 AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
             ]

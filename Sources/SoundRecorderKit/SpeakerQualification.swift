@@ -79,6 +79,7 @@ public final class SpeakerQualification {
         let recorder = ProcessTapRecorder(source: .mix(tap: .systemWide, mic: mic), outputDevice: nil,
             fileURL: directory.appendingPathComponent("mix.caf"), format: .caf, mute: false,
             warmupSeconds: 1, speakerMode: true)
+        recorder.speakerQualificationDirectory = directory.appendingPathComponent("mix.sources")
         self.recorder = recorder
         try recorder.start()
         startedAt = Date()
